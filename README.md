@@ -74,6 +74,18 @@ thunder is a **storage primitive**, not a full database system.
 
 ---
 
+## Dependency Philosophy
+
+thunder follows an **ultra-light dependency** approach:
+
+- **Minimize external crates** — only use dependencies that would require significant development effort to implement correctly (e.g., memory mapping).
+- **Standard library first** — prefer `std` types and traits over external crates.
+- **No transitive bloat** — avoid crates that pull in large dependency trees.
+
+This philosophy serves as a learning opportunity, forcing us to understand and implement core database concepts ourselves rather than delegating to libraries.
+
+---
+
 ## Core Concepts
 
 To work on thunder, you must understand the following concepts:
