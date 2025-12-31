@@ -14,13 +14,13 @@
 
 /// Maximum number of keys in a leaf node before splitting.
 /// Chosen to fit well within a 4KB page with reasonable key/value sizes.
-const LEAF_MAX_KEYS: usize = 32;
+pub const LEAF_MAX_KEYS: usize = 32;
 
 /// Maximum number of keys in a branch node before splitting.
-const BRANCH_MAX_KEYS: usize = 32;
+pub const BRANCH_MAX_KEYS: usize = 32;
 
 /// Minimum number of keys in a node (except root).
-const MIN_KEYS: usize = LEAF_MAX_KEYS / 2;
+pub const MIN_KEYS: usize = LEAF_MAX_KEYS / 2;
 
 /// A B+ tree for in-memory key-value storage.
 ///

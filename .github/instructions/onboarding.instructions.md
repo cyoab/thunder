@@ -15,8 +15,8 @@ src/
 ├── mmap.rs     // Memory-mapped file I/O
 ├── page.rs     // Page constants and types
 ├── meta.rs     // Meta page serialization/validation
-├── freelist.rs // Page allocation (stub)
-└── error.rs    // Error types and Result alias
+├── freelist.rs // Page allocation and free page tracking
+└── error.rs    // Error types with detailed context
 ```
 
 ## Key Components
@@ -27,6 +27,7 @@ src/
 - Initializes two meta pages on new database
 - Loads existing data into in-memory B+ tree on open
 - `persist_tree()` — Serializes tree to disk after meta pages
+- Strict error handling with explicit context for all I/O operations
 
 ### Transactions (`tx.rs`)
 
@@ -38,11 +39,12 @@ src/
 
 ### B+ Tree (`btree.rs`)
 
-- In-memory tree with 32-key node capacity
+- In-memory tree with 32-key node capacity (`LEAF_MAX_KEYS`, `BRANCH_MAX_KEYS`)
 - `get()`, `insert()`, `remove()`, `iter()`
-- Automatic node splitting on overflow
+- Automatic node splitting on overflow (page splitting)
 - Automatic rebalancing (borrow/merge) on underflow
 - Keys ordered lexicographically
+- Copy-on-write semantics via pending tree isolation
 
 ### Memory Mapping (`mmap.rs`)
 
@@ -56,6 +58,16 @@ src/
 - Stores: magic, version, page_size, txid, root, freelist, page_count, checksum
 - `to_bytes()` / `from_bytes()` — Serialization with FNV-1a checksum
 - `validate()` — Checks magic, version, page size
+- **Meta page switching** — Alternates between page 0/1 for crash recovery
+
+### FreeList (`freelist.rs`)
+
+- Tracks freed pages available for reuse
+- `free(page_id)` — Marks page as available
+- `allocate()` — Returns freed page (lowest ID first)
+- O(log n) operations via `BTreeSet`
+- Automatic deduplication
+- `to_bytes()` / `from_bytes()` — Compact serialization
 
 ### Page Constants (`page.rs`)
 
@@ -64,6 +76,15 @@ src/
 - `VERSION = 1`
 - `PageId = u64`
 - `PageType` enum: Meta, Freelist, Branch, Leaf
+
+### Error Handling (`error.rs`)
+
+- 14 specific error variants with context
+- `FileOpen`, `FileSeek`, `FileRead`, `FileWrite`, `FileSync` — I/O errors with path/offset
+- `Corrupted`, `InvalidMetaPage`, `BothMetaPagesInvalid` — Data integrity errors
+- `EntryReadFailed` — Per-entry load errors
+- `TxClosed`, `TxCommitFailed` — Transaction errors
+- All errors preserve source for debugging
 
 ## Storage Format
 
@@ -82,20 +103,23 @@ src/
 
 1. **In-memory B+ tree** — Full tree loaded on open, persisted on commit
 2. **Simple serialization** — Length-prefixed key-value pairs (not page-based yet)
-3. **Alternating meta pages** — txid % 2 determines which page to write
-4. **Pending changes isolation** — WriteTx uses separate tree until commit
-5. **libc for mmap** — Only external dependency, required for memory mapping
+3. **Meta page switching** — txid % 2 determines which page to write (crash recovery)
+4. **Pending changes isolation** — WriteTx uses separate tree until commit (COW)
+5. **Strict error handling** — No `?` operator, explicit match with context
+6. **FreeList for space reclaim** — BTreeSet-based tracking for page reuse
+7. **libc for mmap** — Only external dependency, required for memory mapping
 
 ## Transaction Guarantees
 
-- Uncommitted writes are invisible to readers
+- Uncommitted writes are invisible to readers (copy-on-write)
 - Commit is atomic (meta page swap)
 - Drop without commit = rollback (pending changes discarded)
 - Single writer enforced by Rust's `&mut` borrow
+- Crash recovery via dual meta pages
 
 ## Running Tests
 
 ```bash
-cargo test        # Run all tests (43 total)
+cargo test        # Run all tests (217 total)
 cargo clippy      # Lint check
 ```

@@ -22,7 +22,6 @@ use crate::tx::{ReadTx, WriteTx};
 /// - Only one write transaction can be active at a time.
 pub struct Database {
     /// Path to the database file.
-    #[allow(dead_code)]
     path: std::path::PathBuf,
     /// The underlying file handle.
     file: File,
@@ -43,30 +42,50 @@ impl Database {
     /// or if the database file is corrupted.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
+        let path_buf = path.to_path_buf();
 
         // Check if file exists to determine if we need to initialize.
         let file_exists = path.exists();
 
-        let mut file = OpenOptions::new()
+        let mut file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)?;
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(Error::FileOpen {
+                    path: path_buf,
+                    source: e,
+                });
+            }
+        };
 
-        let (meta, tree) = if file_exists && file.metadata()?.len() > 0 {
+        let file_len = match file.metadata() {
+            Ok(m) => m.len(),
+            Err(e) => {
+                return Err(Error::FileMetadata {
+                    path: path_buf,
+                    source: e,
+                });
+            }
+        };
+
+        let (meta, tree) = if file_exists && file_len > 0 {
             // Existing database: read and validate meta pages, load data.
-            let meta = Self::load_meta(&mut file)?;
+            let meta = Self::load_meta(&mut file, &path_buf)?;
             let tree = Self::load_tree(&mut file, &meta)?;
             (meta, tree)
         } else {
             // New database: initialize with two meta pages.
-            let meta = Self::init_db(&mut file)?;
+            let meta = Self::init_db(&mut file, &path_buf)?;
             (meta, BTree::new())
         };
 
         Ok(Self {
-            path: path.to_path_buf(),
+            path: path_buf,
             file,
             meta,
             tree,
@@ -74,48 +93,118 @@ impl Database {
     }
 
     /// Initializes a new database file with two meta pages.
-    fn init_db(file: &mut File) -> Result<Meta> {
+    fn init_db(file: &mut File, path: &std::path::PathBuf) -> Result<Meta> {
         let meta = Meta::new();
         let meta_bytes = meta.to_bytes();
 
+        // Seek to beginning of file.
+        if let Err(e) = file.seek(SeekFrom::Start(0)) {
+            return Err(Error::FileSeek {
+                offset: 0,
+                context: "initializing database, seeking to start",
+                source: e,
+            });
+        }
+
         // Write meta page 0.
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&meta_bytes)?;
+        if let Err(e) = file.write_all(&meta_bytes) {
+            return Err(Error::FileWrite {
+                offset: 0,
+                len: PAGE_SIZE,
+                context: "writing initial meta page 0",
+                source: e,
+            });
+        }
 
         // Write meta page 1 (identical initially).
-        file.write_all(&meta_bytes)?;
+        if let Err(e) = file.write_all(&meta_bytes) {
+            return Err(Error::FileWrite {
+                offset: PAGE_SIZE as u64,
+                len: PAGE_SIZE,
+                context: "writing initial meta page 1",
+                source: e,
+            });
+        }
 
         // Ensure data is persisted to disk.
-        file.sync_all()?;
+        if let Err(e) = file.sync_all() {
+            return Err(Error::FileSync {
+                context: "syncing initial meta pages",
+                source: e,
+            });
+        }
+
+        // Log successful initialization (only in debug builds).
+        #[cfg(debug_assertions)]
+        {
+            eprintln!(
+                "[thunder] initialized new database at '{}'",
+                path.display()
+            );
+        }
+        let _ = path; // Suppress unused warning in release.
 
         Ok(meta)
     }
 
     /// Loads and validates meta pages from an existing database file.
-    fn load_meta(file: &mut File) -> Result<Meta> {
+    fn load_meta(file: &mut File, _path: &std::path::PathBuf) -> Result<Meta> {
         let mut buf = [0u8; PAGE_SIZE];
 
+        // Seek to meta page 0.
+        if let Err(e) = file.seek(SeekFrom::Start(0)) {
+            return Err(Error::FileSeek {
+                offset: 0,
+                context: "seeking to meta page 0",
+                source: e,
+            });
+        }
+
         // Read meta page 0.
-        file.seek(SeekFrom::Start(0))?;
-        file.read_exact(&mut buf)?;
+        if let Err(e) = file.read_exact(&mut buf) {
+            return Err(Error::FileRead {
+                offset: 0,
+                len: PAGE_SIZE,
+                context: "reading meta page 0",
+                source: e,
+            });
+        }
         let meta0 = Meta::from_bytes(&buf);
 
+        // Seek to meta page 1.
+        let meta1_offset = PAGE_SIZE as u64;
+        if let Err(e) = file.seek(SeekFrom::Start(meta1_offset)) {
+            return Err(Error::FileSeek {
+                offset: meta1_offset,
+                context: "seeking to meta page 1",
+                source: e,
+            });
+        }
+
         // Read meta page 1.
-        file.seek(SeekFrom::Start(PAGE_SIZE as u64))?;
-        file.read_exact(&mut buf)?;
+        if let Err(e) = file.read_exact(&mut buf) {
+            return Err(Error::FileRead {
+                offset: meta1_offset,
+                len: PAGE_SIZE,
+                context: "reading meta page 1",
+                source: e,
+            });
+        }
         let meta1 = Meta::from_bytes(&buf);
 
         // Select the valid meta page with the highest txid.
         match (meta0, meta1) {
             (Some(m0), Some(m1)) => {
-                if !m0.validate() && !m1.validate() {
-                    return Err(Error::Corrupted(
-                        "both meta pages are invalid".to_string(),
-                    ));
+                let m0_valid = m0.validate();
+                let m1_valid = m1.validate();
+
+                if !m0_valid && !m1_valid {
+                    return Err(Error::BothMetaPagesInvalid);
                 }
-                if !m0.validate() {
+
+                if !m0_valid {
                     Ok(m1)
-                } else if !m1.validate() {
+                } else if !m1_valid {
                     Ok(m0)
                 } else if m1.txid > m0.txid {
                     Ok(m1)
@@ -123,16 +212,27 @@ impl Database {
                     Ok(m0)
                 }
             }
-            (Some(m), None) | (None, Some(m)) => {
+            (Some(m), None) => {
                 if m.validate() {
                     Ok(m)
                 } else {
-                    Err(Error::Corrupted("valid meta page is invalid".to_string()))
+                    Err(Error::InvalidMetaPage {
+                        page_number: 0,
+                        reason: "meta page 0 parsed but failed validation",
+                    })
                 }
             }
-            (None, None) => Err(Error::Corrupted(
-                "failed to read any meta page".to_string(),
-            )),
+            (None, Some(m)) => {
+                if m.validate() {
+                    Ok(m)
+                } else {
+                    Err(Error::InvalidMetaPage {
+                        page_number: 1,
+                        reason: "meta page 1 parsed but failed validation",
+                    })
+                }
+            }
+            (None, None) => Err(Error::BothMetaPagesInvalid),
         }
     }
 
@@ -150,34 +250,97 @@ impl Database {
         }
 
         // Seek to data section.
-        file.seek(SeekFrom::Start(data_offset))?;
+        if let Err(e) = file.seek(SeekFrom::Start(data_offset)) {
+            return Err(Error::FileSeek {
+                offset: data_offset,
+                context: "seeking to data section",
+                source: e,
+            });
+        }
 
         // Read number of entries.
         let mut count_buf = [0u8; 8];
         if file.read_exact(&mut count_buf).is_err() {
-            // No data section yet.
+            // No data section yet - this is OK for empty databases.
             return Ok(tree);
         }
         let entry_count = u64::from_le_bytes(count_buf);
 
+        // Validate entry count is reasonable (prevent OOM).
+        const MAX_ENTRIES: u64 = 100_000_000; // 100 million entries max.
+        if entry_count > MAX_ENTRIES {
+            return Err(Error::Corrupted {
+                context: "loading data entries",
+                details: format!(
+                    "entry count {entry_count} exceeds maximum allowed {MAX_ENTRIES}"
+                ),
+            });
+        }
+
         // Read each entry.
-        for _ in 0..entry_count {
+        for entry_idx in 0..entry_count {
             // Read key length.
             let mut len_buf = [0u8; 4];
-            file.read_exact(&mut len_buf)?;
+            if let Err(e) = file.read_exact(&mut len_buf) {
+                return Err(Error::EntryReadFailed {
+                    entry_index: entry_idx,
+                    field: "key length",
+                    source: e,
+                });
+            }
             let key_len = u32::from_le_bytes(len_buf) as usize;
+
+            // Validate key length.
+            const MAX_KEY_LEN: usize = 64 * 1024; // 64KB max key.
+            if key_len > MAX_KEY_LEN {
+                return Err(Error::Corrupted {
+                    context: "loading entry key",
+                    details: format!(
+                        "entry {entry_idx}: key length {key_len} exceeds maximum {MAX_KEY_LEN}"
+                    ),
+                });
+            }
 
             // Read key.
             let mut key = vec![0u8; key_len];
-            file.read_exact(&mut key)?;
+            if let Err(e) = file.read_exact(&mut key) {
+                return Err(Error::EntryReadFailed {
+                    entry_index: entry_idx,
+                    field: "key data",
+                    source: e,
+                });
+            }
 
             // Read value length.
-            file.read_exact(&mut len_buf)?;
+            if let Err(e) = file.read_exact(&mut len_buf) {
+                return Err(Error::EntryReadFailed {
+                    entry_index: entry_idx,
+                    field: "value length",
+                    source: e,
+                });
+            }
             let value_len = u32::from_le_bytes(len_buf) as usize;
+
+            // Validate value length.
+            const MAX_VALUE_LEN: usize = 10 * 1024 * 1024; // 10MB max value.
+            if value_len > MAX_VALUE_LEN {
+                return Err(Error::Corrupted {
+                    context: "loading entry value",
+                    details: format!(
+                        "entry {entry_idx}: value length {value_len} exceeds maximum {MAX_VALUE_LEN}"
+                    ),
+                });
+            }
 
             // Read value.
             let mut value = vec![0u8; value_len];
-            file.read_exact(&mut value)?;
+            if let Err(e) = file.read_exact(&mut value) {
+                return Err(Error::EntryReadFailed {
+                    entry_index: entry_idx,
+                    field: "value data",
+                    source: e,
+                });
+            }
 
             tree.insert(key, value);
         }
@@ -191,21 +354,75 @@ impl Database {
         let data_offset = 2 * PAGE_SIZE as u64;
 
         // Seek to data section.
-        self.file.seek(SeekFrom::Start(data_offset))?;
+        if let Err(e) = self.file.seek(SeekFrom::Start(data_offset)) {
+            return Err(Error::FileSeek {
+                offset: data_offset,
+                context: "seeking to data section for persist",
+                source: e,
+            });
+        }
 
         // Write number of entries.
         let entry_count = self.tree.len() as u64;
-        self.file.write_all(&entry_count.to_le_bytes())?;
+        if let Err(e) = self.file.write_all(&entry_count.to_le_bytes()) {
+            return Err(Error::FileWrite {
+                offset: data_offset,
+                len: 8,
+                context: "writing entry count",
+                source: e,
+            });
+        }
+
+        // Track current offset for error reporting.
+        let mut current_offset = data_offset + 8;
 
         // Write each entry.
         for (key, value) in self.tree.iter() {
-            // Write key length and key.
-            self.file.write_all(&(key.len() as u32).to_le_bytes())?;
-            self.file.write_all(key)?;
+            // Write key length.
+            let key_len_bytes = (key.len() as u32).to_le_bytes();
+            if let Err(e) = self.file.write_all(&key_len_bytes) {
+                return Err(Error::FileWrite {
+                    offset: current_offset,
+                    len: 4,
+                    context: "writing key length",
+                    source: e,
+                });
+            }
+            current_offset += 4;
 
-            // Write value length and value.
-            self.file.write_all(&(value.len() as u32).to_le_bytes())?;
-            self.file.write_all(value)?;
+            // Write key.
+            if let Err(e) = self.file.write_all(key) {
+                return Err(Error::FileWrite {
+                    offset: current_offset,
+                    len: key.len(),
+                    context: "writing key data",
+                    source: e,
+                });
+            }
+            current_offset += key.len() as u64;
+
+            // Write value length.
+            let value_len_bytes = (value.len() as u32).to_le_bytes();
+            if let Err(e) = self.file.write_all(&value_len_bytes) {
+                return Err(Error::FileWrite {
+                    offset: current_offset,
+                    len: 4,
+                    context: "writing value length",
+                    source: e,
+                });
+            }
+            current_offset += 4;
+
+            // Write value.
+            if let Err(e) = self.file.write_all(value) {
+                return Err(Error::FileWrite {
+                    offset: current_offset,
+                    len: value.len(),
+                    context: "writing value data",
+                    source: e,
+                });
+            }
+            current_offset += value.len() as u64;
         }
 
         // Update meta page.
@@ -216,13 +433,39 @@ impl Database {
         let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
         let meta_offset = meta_page * PAGE_SIZE as u64;
 
-        self.file.seek(SeekFrom::Start(meta_offset))?;
-        self.file.write_all(&self.meta.to_bytes())?;
+        if let Err(e) = self.file.seek(SeekFrom::Start(meta_offset)) {
+            return Err(Error::FileSeek {
+                offset: meta_offset,
+                context: "seeking to meta page for update",
+                source: e,
+            });
+        }
+
+        let meta_bytes = self.meta.to_bytes();
+        if let Err(e) = self.file.write_all(&meta_bytes) {
+            return Err(Error::FileWrite {
+                offset: meta_offset,
+                len: PAGE_SIZE,
+                context: "writing updated meta page",
+                source: e,
+            });
+        }
 
         // Sync to disk.
-        self.file.sync_all()?;
+        if let Err(e) = self.file.sync_all() {
+            return Err(Error::FileSync {
+                context: "syncing after persist",
+                source: e,
+            });
+        }
 
         Ok(())
+    }
+
+    /// Returns the path to the database file.
+    #[allow(dead_code)]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Returns a reference to the current meta page.
