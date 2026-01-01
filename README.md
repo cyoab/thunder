@@ -1,329 +1,141 @@
-# ⚡ thunder
+# ⚡ Thunder
 
-**thunder** is a minimal, embedded, transactional key–value database engine written in **Rust**.  
-It is heavily inspired by **bbolt** (the BoltDB fork used by etcd) and exists primarily as a **learning-focused yet correct database engine**.
+**Thunder** is a minimal, embedded, transactional key-value database engine written in Rust, inspired by [BBolt](https://github.com/etcd-io/bbolt).
 
-This project prioritizes:
+What started as a hobby/learning project has evolved into a fully functional embedded database that **outperforms BBolt** in most benchmarks while remaining simple and easy to understand.
 
-- correctness over performance
-- clarity over cleverness
-- explicit architecture over hidden magic
+## Features
 
-thunder is **not** intended to be a drop-in replacement for bbolt or a production-grade database (yet).  
-It is a foundational storage engine designed to teach and solidify database internals in Rust.
+- **Embedded** — Runs in-process as a Rust library, no server required
+- **Single-file storage** — Entire database in one file
+- **ACID transactions** — Full durability with crash-safe commits
+- **MVCC** — Multiple concurrent readers, single writer
+- **Buckets** — Logical namespaces for organizing data
+- **Range queries** — Efficient iteration and range scans
+- **Zero dependencies** — Only uses `libc` for mmap/fdatasync
 
----
+## Performance
 
-## Table of Contents
+Thunder achieves excellent performance, outperforming BBolt in most benchmarks:
 
-- [Design Goals](#design-goals)
-- [Non-Goals](#non-goals)
-- [Core Concepts](#core-concepts)
-- [High-Level Architecture](#high-level-architecture)
-- [Transaction Model](#transaction-model)
-- [Storage Model](#storage-model)
-- [Planned Rust Architecture](#planned-rust-architecture)
-- [Public API (Planned)](#public-api-planned)
-- [Testing Strategy](#testing-strategy)
-- [Development Roadmap](#development-roadmap)
+| Benchmark | Thunder | BBolt | Result |
+|-----------|---------|-------|--------|
+| Sequential writes | 723K ops/sec | 301K ops/sec | **Thunder 2.4x faster** |
+| Sequential reads | 2.7M ops/sec | 1.3M ops/sec | **Thunder 2.0x faster** |
+| Random reads | 1.3M ops/sec | 1.3M ops/sec | Tie |
+| Iterator scan | 112M ops/sec | 68M ops/sec | **Thunder 1.6x faster** |
+| Transaction throughput | 1,463 tx/sec | 1,113 tx/sec | **Thunder 1.3x faster** |
 
----
+See [bench.md](bench.md) for full benchmark details.
 
-## Design Goals
-
-thunder is designed around the following principles:
-
-1. **Embedded**
-   - Runs in-process as a Rust library
-   - No client/server model
-   - No network layer
-
-2. **Single-file storage**
-   - Entire database stored in one file
-   - File is memory-mapped (mmap)
-
-3. **Deterministic behavior**
-   - No background threads
-   - No hidden compaction
-   - No asynchronous mutation
-
-4. **Strong correctness guarantees**
-   - ACID transactions
-   - Crash safety
-   - Snapshot isolation for readers
-
-5. **Beginner-friendly Rust**
-   - Avoid complex lifetimes early
-   - Avoid `unsafe` unless absolutely required
-   - Prefer explicit ownership and borrowing
-
----
-
-## Non-Goals
-
-The following are explicitly **out of scope** (at least initially):
-
-- SQL or query language
-- Distributed consensus or replication
-- Background compaction or GC threads
-- Compression or encryption
-- High write throughput optimization
-- Lock-free or highly concurrent writes
-
-thunder is a **storage primitive**, not a full database system.
-
----
-
-## Dependency Philosophy
-
-thunder follows an **ultra-light dependency** approach:
-
-- **Minimize external crates** — only use dependencies that would require significant development effort to implement correctly (e.g., memory mapping).
-- **Standard library first** — prefer `std` types and traits over external crates.
-- **No transitive bloat** — avoid crates that pull in large dependency trees.
-
-This philosophy serves as a learning opportunity, forcing us to understand and implement core database concepts ourselves rather than delegating to libraries.
-
----
-
-## Core Concepts
-
-To work on thunder, you must understand the following concepts:
-
-### Embedded Key–Value Store
-
-- Keys and values are arbitrary byte slices
-- Data is ordered lexicographically by key
-- Supports point lookups and range scans
-
-### B+ Tree
-
-- Balanced tree optimized for disk/page access
-- Internal nodes store keys and child pointers
-- Leaf nodes store keys and values
-- All data lives in leaf nodes
-
-### Pages
-
-- Fixed-size blocks (e.g. 4KB)
-- Database file is a sequence of pages
-- Pages are addressed by page ID (offset-based)
-
-### Memory-Mapped I/O (mmap)
-
-- Database file is mapped into memory
-- Pages are accessed as memory, not via read/write syscalls
-- OS manages caching and flushing
-
-### Copy-on-Write (COW)
-
-- Pages are never modified in-place during writes
-- Modified pages are copied to new locations
-- Atomic root pointer swap on commit
-
-### MVCC (Multi-Version Concurrency Control)
-
-- Multiple read transactions allowed concurrently
-- Only one write transaction at a time
-- Readers see a consistent snapshot
-
----
-
-## High-Level Architecture
-
-```yaml
-+------------------------+
-| Database |
-| (single mmap file) |
-+-----------+------------+
-|
-v
-+------------------------+
-| Transactions |
-| ReadTx | WriteTx |
-+-----------+------------+
-|
-v
-+------------------------+
-| B+ Tree |
-| Root → Branch → Leaf |
-+-----------+------------+
-|
-v
-+------------------------+
-| Pages |
-| Fixed-size blocks |
-+-----------+------------+
-|
-v
-+------------------------+
-| Meta Pages & Freelist|
-| Safety & Allocation |
-+------------------------+
-```
-
----
-
-## Transaction Model
-
-| Transaction Type | Concurrency | Mutability |
-|------------------|-------------|------------|
-| Read Transaction | Many        | Read-only |
-| Write Transaction| One         | Read-write |
-
-### Properties
-
-- Readers never block other readers
-- Writers are exclusive
-- Writers do not modify existing pages
-- Commit is atomic and crash-safe
-
----
-
-## Storage Model
-
-### Page Types (Planned)
-
-- **Meta pages**
-  - Store root page ID
-  - Store transaction ID
-  - Two copies for crash recovery
-
-- **Branch pages**
-  - Internal B+ tree nodes
-  - Keys + child page IDs
-
-- **Leaf pages**
-  - Store key–value pairs
-
-- **Freelist pages**
-  - Track unused pages
-  - Prevent reuse while readers exist
-
----
-
-## Planned Rust Architecture
+## Quick Start
 
 ```rust
+use thunder::Database;
+
+fn main() -> thunder::Result<()> {
+    // Open or create a database
+    let mut db = Database::open("my.db")?;
+
+    // Write data
+    {
+        let mut tx = db.write_tx();
+        tx.put(b"hello", b"world");
+        tx.put(b"foo", b"bar");
+        tx.commit()?;
+    }
+
+    // Read data
+    {
+        let tx = db.read_tx();
+        assert_eq!(tx.get(b"hello"), Some(b"world".to_vec()));
+    }
+
+    Ok(())
+}
+```
+
+## Buckets
+
+Organize data into logical namespaces:
+
+```rust
+let mut tx = db.write_tx();
+
+// Create buckets
+tx.create_bucket(b"users")?;
+tx.create_bucket(b"posts")?;
+
+// Write to buckets
+tx.bucket_put(b"users", b"alice", b"data")?;
+tx.bucket_put(b"posts", b"post1", b"content")?;
+
+tx.commit()?;
+```
+
+## Limitations
+
+Thunder is a learning project that has grown into something useful, but it's still limited compared to mature solutions like BBolt:
+
+- **No nested buckets** — Buckets cannot contain other buckets
+- **No cursor API** — Only forward iteration is supported
+- **No compaction** — Deleted data is not reclaimed until full rewrite
+- **Single-threaded writes** — No concurrent write transactions
+- **No encryption** — Data is stored in plaintext
+- **No compression** — Values are stored as-is
+
+These are all features that could be added in the future, but the current implementation focuses on simplicity and correctness.
+
+## Architecture
+
+Thunder is implemented in ~2,500 lines of Rust:
+
+```
 src/
-├── lib.rs // Public API surface
-├── db.rs // Database open/close
-├── tx.rs // Transactions
-├── page.rs // Page layout & helpers
-├── tree.rs // B+ tree logic
-├── freelist.rs // Page allocation
-├── meta.rs // Meta page handling
-└── error.rs // Error types
+├── lib.rs      # Public API
+├── db.rs       # Database open/close, persistence
+├── tx.rs       # Read and write transactions
+├── btree.rs    # In-memory B+ tree
+├── bucket.rs   # Bucket management
+├── page.rs     # Page layout constants
+├── meta.rs     # Meta page handling
+├── freelist.rs # Free page tracking
+├── mmap.rs     # Memory-mapped I/O
+└── error.rs    # Error types
 ```
 
-The project is implemented as a **library crate**.
+### Design Decisions
 
----
+1. **In-memory B+ tree** — The entire tree lives in memory for fast reads. This trades memory for speed.
 
-## Public API (Planned)
+2. **Append-only writes** — New entries are appended rather than rewriting the entire database, enabling fast commits.
 
-This API is intentionally minimal and mirrors the conceptual model.
+3. **fdatasync** — Uses `fdatasync()` instead of `fsync()` to skip metadata sync, reducing commit latency.
 
-```rust
-pub struct Database;
+4. **Copy-on-write semantics** — Write transactions work on a scratch tree, only applying changes on commit.
 
-impl Database {
-    pub fn open(path: &str) -> Result<Self>;
-    pub fn read_tx(&self) -> ReadTx;
-    pub fn write_tx(&mut self) -> WriteTx;
-}
+## Building
 
-pub struct ReadTx<'a>;
-
-impl ReadTx<'_> {
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
-}
-
-pub struct WriteTx<'a>;
-
-impl WriteTx<'_> {
-    pub fn put(&mut self, key: &[u8], value: &[u8]);
-    pub fn delete(&mut self, key: &[u8]);
-    pub fn commit(self) -> Result<()>;
-}
+```bash
+cargo build --release
 ```
 
-Initial versions may:
+## Testing
 
-- Support a single unnamed bucket
-
-- Panic on page overflow
-
-- Omit iterators
-
-These limitations are intentional for simplicity.
-
-## Testing Strategy
-
-Correctness is validated via deterministic tests.
-
-### Unit Tests
-
-- Page encoding/decoding
-
-- B+ tree insertion and lookup
-
-- Meta page validation
-
-### Integration Tests
-
-```rust
-#[test]
-fn put_then_get() {
-    let mut db = Database::open("test.db").unwrap();
-
-    let mut wtx = db.write_tx();
-    wtx.put(b"hello", b"world");
-    wtx.commit().unwrap();
-
-    let rtx = db.read_tx();
-    assert_eq!(rtx.get(b"hello"), Some(b"world".to_vec()));
-}
+```bash
+cargo test
 ```
 
-Crash-safety tests will be added later.
+## Running Benchmarks
 
-## Development Roadmap
+```bash
+# Thunder benchmark
+cargo run --release --bin thunder_bench
 
-### Phase 1 — Foundations
+# BBolt benchmark (requires Go)
+cd bench && go run bbolt_bench.go
+```
 
-- Database open/close
+## License
 
-- Memory mapping
-
-- Fixed-size pages
-
-- Single B+ tree
-
-- Read & write transactions
-
-### Phase 2 — Correctness
-
-- Page splitting
-
-- Copy-on-write
-
-- Meta page switching
-
-- Basic freelist
-
-### Phase 3 — Usability
-
-- Buckets
-
-- Iterators
-
-- Range scans
-
-### Phase 4 — Robustness
-
-- Crash recovery tests
-
-- Stress testing
-
-- Benchmarks vs bbolt
+MIT

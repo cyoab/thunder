@@ -425,19 +425,39 @@ impl<'db> WriteTx<'db> {
         // Record the number of operations for error context.
         let deletion_count = self.deleted.len();
         let insertion_count = self.pending.len();
+        let has_deletions = !self.deleted.is_empty();
 
         // Apply deletions to main tree.
         for key in &self.deleted {
             self.db.tree_mut().remove(key);
         }
 
+        // Collect new entries for incremental persist before applying to tree.
+        // We need to collect them because the iterator borrows pending.
+        let new_entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .pending
+            .iter()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+
         // Apply pending insertions to main tree.
         for (key, value) in self.pending.iter() {
             self.db.tree_mut().insert(key.to_vec(), value.to_vec());
         }
 
-        // Persist to disk.
-        match self.db.persist_tree() {
+        // Use incremental persist for insert-only workloads.
+        let persist_result = if has_deletions {
+            // Deletions require a full rewrite (or future: lazy compaction).
+            self.db.persist_tree()
+        } else {
+            // Append-only: use incremental persist for massive speedup.
+            self.db.persist_incremental(
+                new_entries.iter().map(|(k, v)| (k.as_slice(), v.as_slice())),
+                false,
+            )
+        };
+
+        match persist_result {
             Ok(()) => {
                 self.committed = true;
                 Ok(())

@@ -2,8 +2,11 @@
 //! Copyright (c) YOAB. All rights reserved.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use crate::btree::BTree;
 use crate::error::{Error, Result};
@@ -29,6 +32,10 @@ pub struct Database {
     meta: Meta,
     /// In-memory B+ tree storing all key-value pairs.
     tree: BTree,
+    /// Current write offset in the data section (for append-only writes).
+    data_end_offset: u64,
+    /// Number of entries currently persisted.
+    persisted_entry_count: u64,
 }
 
 impl Database {
@@ -73,15 +80,16 @@ impl Database {
             }
         };
 
-        let (meta, tree) = if file_exists && file_len > 0 {
+        let (meta, tree, data_end_offset, persisted_entry_count) = if file_exists && file_len > 0 {
             // Existing database: read and validate meta pages, load data.
             let meta = Self::load_meta(&mut file, &path_buf)?;
-            let tree = Self::load_tree(&mut file, &meta)?;
-            (meta, tree)
+            let (tree, data_end, count) = Self::load_tree(&mut file, &meta)?;
+            (meta, tree, data_end, count)
         } else {
             // New database: initialize with two meta pages.
             let meta = Self::init_db(&mut file, &path_buf)?;
-            (meta, BTree::new())
+            let data_offset = 2 * PAGE_SIZE as u64 + 8; // After meta pages + entry count
+            (meta, BTree::new(), data_offset, 0)
         };
 
         Ok(Self {
@@ -89,6 +97,8 @@ impl Database {
             file,
             meta,
             tree,
+            data_end_offset,
+            persisted_entry_count,
         })
     }
 
@@ -237,7 +247,7 @@ impl Database {
     }
 
     /// Loads the B+ tree data from the database file.
-    fn load_tree(file: &mut File, meta: &Meta) -> Result<BTree> {
+    fn load_tree(file: &mut File, meta: &Meta) -> Result<(BTree, u64, u64)> {
         let mut tree = BTree::new();
 
         // Data starts after the two meta pages.
@@ -246,7 +256,7 @@ impl Database {
         // Read the data page count from meta.
         if meta.root == 0 {
             // No data stored yet.
-            return Ok(tree);
+            return Ok((tree, data_offset + 8, 0));
         }
 
         // Seek to data section.
@@ -262,7 +272,7 @@ impl Database {
         let mut count_buf = [0u8; 8];
         if file.read_exact(&mut count_buf).is_err() {
             // No data section yet - this is OK for empty databases.
-            return Ok(tree);
+            return Ok((tree, data_offset + 8, 0));
         }
         let entry_count = u64::from_le_bytes(count_buf);
 
@@ -277,6 +287,9 @@ impl Database {
             });
         }
 
+        // Track current position for computing end offset.
+        let mut current_offset = data_offset + 8;
+
         // Read each entry.
         for entry_idx in 0..entry_count {
             // Read key length.
@@ -289,6 +302,7 @@ impl Database {
                 });
             }
             let key_len = u32::from_le_bytes(len_buf) as usize;
+            current_offset += 4;
 
             // Validate key length.
             const MAX_KEY_LEN: usize = 64 * 1024; // 64KB max key.
@@ -310,6 +324,7 @@ impl Database {
                     source: e,
                 });
             }
+            current_offset += key_len as u64;
 
             // Read value length.
             if let Err(e) = file.read_exact(&mut len_buf) {
@@ -320,9 +335,10 @@ impl Database {
                 });
             }
             let value_len = u32::from_le_bytes(len_buf) as usize;
+            current_offset += 4;
 
             // Validate value length.
-            const MAX_VALUE_LEN: usize = 10 * 1024 * 1024; // 10MB max value.
+            const MAX_VALUE_LEN: usize = 512 * 1024 * 1024; // 512MB max value.
             if value_len > MAX_VALUE_LEN {
                 return Err(Error::Corrupted {
                     context: "loading entry value",
@@ -341,14 +357,16 @@ impl Database {
                     source: e,
                 });
             }
+            current_offset += value_len as u64;
 
             tree.insert(key, value);
         }
 
-        Ok(tree)
+        Ok((tree, current_offset, entry_count))
     }
 
     /// Persists the B+ tree data to the database file.
+    /// This performs a FULL rewrite of all data - use `persist_incremental` for better performance.
     pub(crate) fn persist_tree(&mut self) -> Result<()> {
         // Data starts after the two meta pages.
         let data_offset = 2 * PAGE_SIZE as u64;
@@ -362,9 +380,12 @@ impl Database {
             });
         }
 
+        // Use a buffered writer for better performance.
+        let mut writer = BufWriter::with_capacity(64 * 1024, &self.file);
+
         // Write number of entries.
         let entry_count = self.tree.len() as u64;
-        if let Err(e) = self.file.write_all(&entry_count.to_le_bytes()) {
+        if let Err(e) = writer.write_all(&entry_count.to_le_bytes()) {
             return Err(Error::FileWrite {
                 offset: data_offset,
                 len: 8,
@@ -380,7 +401,7 @@ impl Database {
         for (key, value) in self.tree.iter() {
             // Write key length.
             let key_len_bytes = (key.len() as u32).to_le_bytes();
-            if let Err(e) = self.file.write_all(&key_len_bytes) {
+            if let Err(e) = writer.write_all(&key_len_bytes) {
                 return Err(Error::FileWrite {
                     offset: current_offset,
                     len: 4,
@@ -391,7 +412,7 @@ impl Database {
             current_offset += 4;
 
             // Write key.
-            if let Err(e) = self.file.write_all(key) {
+            if let Err(e) = writer.write_all(key) {
                 return Err(Error::FileWrite {
                     offset: current_offset,
                     len: key.len(),
@@ -403,7 +424,7 @@ impl Database {
 
             // Write value length.
             let value_len_bytes = (value.len() as u32).to_le_bytes();
-            if let Err(e) = self.file.write_all(&value_len_bytes) {
+            if let Err(e) = writer.write_all(&value_len_bytes) {
                 return Err(Error::FileWrite {
                     offset: current_offset,
                     len: 4,
@@ -414,7 +435,7 @@ impl Database {
             current_offset += 4;
 
             // Write value.
-            if let Err(e) = self.file.write_all(value) {
+            if let Err(e) = writer.write_all(value) {
                 return Err(Error::FileWrite {
                     offset: current_offset,
                     len: value.len(),
@@ -424,6 +445,19 @@ impl Database {
             }
             current_offset += value.len() as u64;
         }
+
+        // Flush the buffered writer.
+        if let Err(e) = writer.flush() {
+            return Err(Error::FileSync {
+                context: "flushing buffered writer",
+                source: e,
+            });
+        }
+        drop(writer);
+
+        // Update tracking info.
+        self.data_end_offset = current_offset;
+        self.persisted_entry_count = entry_count;
 
         // Update meta page.
         self.meta.txid += 1;
@@ -451,15 +485,222 @@ impl Database {
             });
         }
 
-        // Sync to disk.
-        if let Err(e) = self.file.sync_all() {
-            return Err(Error::FileSync {
-                context: "syncing after persist",
+        // Use fdatasync instead of fsync for better performance (skips metadata sync).
+        Self::fdatasync(&self.file)?;
+
+        Ok(())
+    }
+
+    /// Persists incremental changes (new insertions only) to the database file.
+    ///
+    /// This is much faster than `persist_tree` for workloads with many small commits
+    /// because it only appends new entries rather than rewriting all data.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_entries` - Iterator of (key, value) pairs to append.
+    /// * `has_deletions` - If true, falls back to full rewrite (deletions require compaction).
+    pub(crate) fn persist_incremental<'a, I>(
+        &mut self,
+        new_entries: I,
+        has_deletions: bool,
+    ) -> Result<()>
+    where
+        I: Iterator<Item = (&'a [u8], &'a [u8])>,
+    {
+        // If there are deletions, we need to do a full rewrite.
+        // In the future, we could implement lazy compaction.
+        if has_deletions {
+            return self.persist_tree();
+        }
+
+        // Collect new entries for writing.
+        let entries: Vec<_> = new_entries.collect();
+        if entries.is_empty() {
+            // Nothing to write, but still need to sync meta.
+            return self.sync_meta_only();
+        }
+
+        let new_entry_count = entries.len() as u64;
+        let total_entry_count = self.persisted_entry_count + new_entry_count;
+
+        // Seek to append position.
+        if let Err(e) = self.file.seek(SeekFrom::Start(self.data_end_offset)) {
+            return Err(Error::FileSeek {
+                offset: self.data_end_offset,
+                context: "seeking to append position",
                 source: e,
             });
         }
 
+        // Use a buffered writer for better performance.
+        let mut writer = BufWriter::with_capacity(64 * 1024, &self.file);
+        let mut current_offset = self.data_end_offset;
+
+        // Append new entries.
+        for (key, value) in &entries {
+            // Write key length.
+            let key_len_bytes = (key.len() as u32).to_le_bytes();
+            if let Err(e) = writer.write_all(&key_len_bytes) {
+                return Err(Error::FileWrite {
+                    offset: current_offset,
+                    len: 4,
+                    context: "writing key length (incremental)",
+                    source: e,
+                });
+            }
+            current_offset += 4;
+
+            // Write key.
+            if let Err(e) = writer.write_all(key) {
+                return Err(Error::FileWrite {
+                    offset: current_offset,
+                    len: key.len(),
+                    context: "writing key data (incremental)",
+                    source: e,
+                });
+            }
+            current_offset += key.len() as u64;
+
+            // Write value length.
+            let value_len_bytes = (value.len() as u32).to_le_bytes();
+            if let Err(e) = writer.write_all(&value_len_bytes) {
+                return Err(Error::FileWrite {
+                    offset: current_offset,
+                    len: 4,
+                    context: "writing value length (incremental)",
+                    source: e,
+                });
+            }
+            current_offset += 4;
+
+            // Write value.
+            if let Err(e) = writer.write_all(value) {
+                return Err(Error::FileWrite {
+                    offset: current_offset,
+                    len: value.len(),
+                    context: "writing value data (incremental)",
+                    source: e,
+                });
+            }
+            current_offset += value.len() as u64;
+        }
+
+        // Flush the buffered writer.
+        if let Err(e) = writer.flush() {
+            return Err(Error::FileSync {
+                context: "flushing incremental writer",
+                source: e,
+            });
+        }
+        drop(writer);
+
+        // Update entry count at the beginning of data section.
+        let data_offset = 2 * PAGE_SIZE as u64;
+        if let Err(e) = self.file.seek(SeekFrom::Start(data_offset)) {
+            return Err(Error::FileSeek {
+                offset: data_offset,
+                context: "seeking to update entry count",
+                source: e,
+            });
+        }
+        if let Err(e) = self.file.write_all(&total_entry_count.to_le_bytes()) {
+            return Err(Error::FileWrite {
+                offset: data_offset,
+                len: 8,
+                context: "updating entry count",
+                source: e,
+            });
+        }
+
+        // Update tracking info.
+        self.data_end_offset = current_offset;
+        self.persisted_entry_count = total_entry_count;
+
+        // Update and sync meta page.
+        self.meta.txid += 1;
+        self.meta.root = 1; // We have data
+
+        let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
+        let meta_offset = meta_page * PAGE_SIZE as u64;
+
+        if let Err(e) = self.file.seek(SeekFrom::Start(meta_offset)) {
+            return Err(Error::FileSeek {
+                offset: meta_offset,
+                context: "seeking to meta page for incremental update",
+                source: e,
+            });
+        }
+
+        let meta_bytes = self.meta.to_bytes();
+        if let Err(e) = self.file.write_all(&meta_bytes) {
+            return Err(Error::FileWrite {
+                offset: meta_offset,
+                len: PAGE_SIZE,
+                context: "writing meta page (incremental)",
+                source: e,
+            });
+        }
+
+        // Use fdatasync for better performance.
+        Self::fdatasync(&self.file)?;
+
         Ok(())
+    }
+
+    /// Syncs only the meta page (for commits with no data changes).
+    fn sync_meta_only(&mut self) -> Result<()> {
+        self.meta.txid += 1;
+
+        let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
+        let meta_offset = meta_page * PAGE_SIZE as u64;
+
+        if let Err(e) = self.file.seek(SeekFrom::Start(meta_offset)) {
+            return Err(Error::FileSeek {
+                offset: meta_offset,
+                context: "seeking to meta page for sync",
+                source: e,
+            });
+        }
+
+        let meta_bytes = self.meta.to_bytes();
+        if let Err(e) = self.file.write_all(&meta_bytes) {
+            return Err(Error::FileWrite {
+                offset: meta_offset,
+                len: PAGE_SIZE,
+                context: "writing meta page (sync only)",
+                source: e,
+            });
+        }
+
+        Self::fdatasync(&self.file)?;
+        Ok(())
+    }
+
+    /// Performs fdatasync on Unix systems, falling back to sync_all elsewhere.
+    /// fdatasync is faster than fsync because it doesn't sync file metadata.
+    #[inline]
+    fn fdatasync(file: &File) -> Result<()> {
+        #[cfg(unix)]
+        {
+            // SAFETY: fdatasync is a standard POSIX call, safe with a valid fd.
+            let ret = unsafe { libc::fdatasync(file.as_raw_fd()) };
+            if ret != 0 {
+                return Err(Error::FileSync {
+                    context: "fdatasync failed",
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            file.sync_all().map_err(|e| Error::FileSync {
+                context: "sync_all fallback",
+                source: e,
+            })
+        }
     }
 
     /// Returns the path to the database file.
