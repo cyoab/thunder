@@ -13,6 +13,7 @@ pub mod error;
 pub mod freelist;
 pub mod group_commit;
 pub mod io_backend;
+pub mod ivec;
 pub mod meta;
 pub mod mmap;
 pub mod node_pool;

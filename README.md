@@ -1,8 +1,10 @@
 # ⚡ Thunder
 
-**Thunder** is a minimal, embedded, transactional key-value database engine written in Rust, inspired by [BBolt](https://github.com/etcd-io/bbolt).
+**Thunder** is a fast, embedded, transactional key-value database engine written in Rust, inspired by [BBolt](https://github.com/etcd-io/bbolt).
 
-What started as a hobby/learning project has evolved into a fully functional embedded database that **outperforms BBolt** in most benchmarks while remaining simple and easy to understand.
+What started as a hobby/learning project has evolved into a capable embedded database that **outperforms BBolt** in most benchmarks while remaining relatively simple (~3,000 lines of Rust).
+
+> ⚠️ **Work in Progress**: Thunder is still a hobby project under active development. If you need a battle-tested, production-ready embedded database, consider [SQLite](https://sqlite.org/), [RocksDB](https://rocksdb.org/), or [BBolt](https://github.com/etcd-io/bbolt). Thunder is great for learning, experimentation, and non-critical use cases.
 
 ## Features
 
@@ -12,21 +14,25 @@ What started as a hobby/learning project has evolved into a fully functional emb
 - **MVCC** — Multiple concurrent readers, single writer
 - **Buckets** — Logical namespaces for organizing data
 - **Range queries** — Efficient iteration and range scans
-- **Zero dependencies** — Only uses `libc` for mmap/fdatasync
+- **Zero-copy reads** — `get_ref()` API returns references without allocation
+- **Bloom filter** — Fast rejection of non-existent keys (8.5M ops/sec)
+- **CRC32 checksums** — Data integrity verification with SIMD acceleration
+- **Minimal dependencies** — Only `libc`, `crc32fast`, and `nix`
 
 ## Performance
 
-Thunder achieves excellent performance, outperforming BBolt in most benchmarks:
+Thunder achieves excellent performance, outperforming BBolt across most workloads:
 
 | Benchmark | Thunder | BBolt | Result |
 |-----------|---------|-------|--------|
-| Sequential writes | 723K ops/sec | 301K ops/sec | **Thunder 2.4x faster** |
-| Sequential reads | 2.7M ops/sec | 1.3M ops/sec | **Thunder 2.0x faster** |
-| Random reads | 1.3M ops/sec | 1.3M ops/sec | Tie |
-| Iterator scan | 112M ops/sec | 68M ops/sec | **Thunder 1.6x faster** |
-| Transaction throughput | 1,463 tx/sec | 1,113 tx/sec | **Thunder 1.3x faster** |
+| Sequential writes | 740K ops/sec | 395K ops/sec | **Thunder 1.9× faster** |
+| Sequential reads | 2.6M ops/sec | 1.6M ops/sec | **Thunder 1.7× faster** |
+| Random reads | 1.1M ops/sec | 697K ops/sec | **Thunder 1.6× faster** |
+| Iterator scan | 78M ops/sec | 63M ops/sec | **Thunder 1.2× faster** |
+| Mixed workload | 6,120 ops/sec | 5,462 ops/sec | **Thunder 1.1× faster** |
+| Transaction throughput | 1,590 tx/sec | 1,300 tx/sec | **Thunder 1.2× faster** |
 
-See [bench.md](bench.md) for full benchmark details.
+See [bench.md](bench.md) for full benchmark details including YCSB workloads and large value performance.
 
 ## Quick Start
 
@@ -75,7 +81,7 @@ tx.commit()?;
 
 ## Limitations
 
-Thunder is a learning project that has grown into something useful, but it's still limited compared to mature solutions like BBolt:
+Thunder is a hobby project that has grown into something useful, but it has limitations compared to mature solutions:
 
 - **No nested buckets** — Buckets cannot contain other buckets
 - **No cursor API** — Only forward iteration is supported
@@ -83,36 +89,40 @@ Thunder is a learning project that has grown into something useful, but it's sti
 - **Single-threaded writes** — No concurrent write transactions
 - **No encryption** — Data is stored in plaintext
 - **No compression** — Values are stored as-is
+- **Limited testing** — Not battle-tested in production environments
 
-These are all features that could be added in the future, but the current implementation focuses on simplicity and correctness.
+For production use cases requiring stability and robustness, please use established solutions like SQLite, RocksDB, or BBolt.
 
 ## Architecture
 
-Thunder is implemented in ~2,500 lines of Rust:
+Thunder is implemented in ~3,000 lines of Rust:
 
 ```
 src/
-├── lib.rs      # Public API
-├── db.rs       # Database open/close, persistence
-├── tx.rs       # Read and write transactions
-├── btree.rs    # In-memory B+ tree
-├── bucket.rs   # Bucket management
-├── page.rs     # Page layout constants
-├── meta.rs     # Meta page handling
-├── freelist.rs # Free page tracking
-├── mmap.rs     # Memory-mapped I/O
-└── error.rs    # Error types
+├── lib.rs        # Public API
+├── db.rs         # Database open/close, persistence
+├── tx.rs         # Read and write transactions
+├── btree.rs      # In-memory B+ tree
+├── bucket.rs     # Bucket management
+├── bloom.rs      # Bloom filter for fast negative lookups
+├── overflow.rs   # Large value handling
+├── page.rs       # Page layout constants
+├── meta.rs       # Meta page handling
+├── mmap.rs       # Memory-mapped I/O
+├── ivec.rs       # Inline vector optimization
+└── error.rs      # Error types
 ```
 
-### Design Decisions
+### Key Optimizations
 
-1. **In-memory B+ tree** — The entire tree lives in memory for fast reads. This trades memory for speed.
-
-2. **Append-only writes** — New entries are appended rather than rewriting the entire database, enabling fast commits.
-
-3. **fdatasync** — Uses `fdatasync()` instead of `fsync()` to skip metadata sync, reducing commit latency.
-
-4. **Copy-on-write semantics** — Write transactions work on a scratch tree, only applying changes on commit.
+1. **In-memory B+ tree** — The entire tree lives in memory for fast reads
+2. **Append-only writes** — New entries are appended, enabling fast commits
+3. **fdatasync** — Uses `fdatasync()` instead of `fsync()` to reduce latency
+4. **Zero-copy reads** — `get_ref()` returns references without allocation
+5. **Bloom filter** — Fast rejection of non-existent keys
+6. **Direct overflow format** — Large values use compact storage (12 bytes overhead)
+7. **SIMD checksums** — CRC32 with hardware acceleration (~10 GB/s)
+8. **pwrite** — Positioned writes avoid seek syscalls
 
 ## Building
 
@@ -129,11 +139,13 @@ cargo test
 ## Running Benchmarks
 
 ```bash
-# Thunder benchmark
+# Run Thunder benchmark suite
 cargo run --release --bin thunder_bench
+```
 
-# BBolt benchmark (requires Go)
-cd bench && go run bbolt_bench.go
+## License
+
+MIT
 ```
 
 ## License

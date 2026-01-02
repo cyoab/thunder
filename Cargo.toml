@@ -6,13 +6,17 @@ edition = "2024"
 [features]
 default = []
 io_uring = ["dep:io-uring"]
+# Skip data checksums for maximum performance (trust filesystem for integrity)
+no_checksum = []
 
 [dependencies]
 libc = "0.2.178"
+crc32fast = "1.5"
+nix = { version = "0.29", features = ["fs", "uio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
 
 [[bin]]
 name = "thunder_bench"
-path = "bench/thunder_bench.rs"
+path = "bench/main.rs"

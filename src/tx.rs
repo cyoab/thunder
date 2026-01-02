@@ -170,6 +170,20 @@ impl<'db> WriteTx<'db> {
         self.pending.insert(key.to_vec(), value.to_vec());
     }
 
+    /// Inserts or updates a key-value pair, taking ownership of the data.
+    ///
+    /// This is more efficient than `put()` for large values as it avoids
+    /// copying the value data.
+    ///
+    /// If the key already exists, its value will be overwritten.
+    #[inline]
+    pub fn put_owned(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        // Remove from deleted list if present.
+        self.deleted.retain(|k| k.as_slice() != key);
+        // Add to pending changes without copying.
+        self.pending.insert(key, value);
+    }
+
     /// Deletes a key from the database.
     ///
     /// Does nothing if the key does not exist.
@@ -474,38 +488,53 @@ impl<'db> WriteTx<'db> {
             self.db.tree_mut().remove(key);
         }
 
-        // Collect new entries for incremental persist before applying to tree.
-        // We need to collect them because the iterator borrows pending.
-        let new_entries: Vec<(Vec<u8>, Vec<u8>)> = self
-            .pending
-            .iter()
-            .map(|(k, v)| (k.to_vec(), v.to_vec()))
-            .collect();
-
-        // Apply pending insertions to main tree.
-        for (key, value) in self.pending.iter() {
-            self.db.tree_mut().insert(key.to_vec(), value.to_vec());
-        }
-
         // Use incremental persist only for pure insert workloads.
         // Updates and deletions require a full rewrite.
         let persist_result = if has_deletions || has_updates {
+            // Collect new entries for full rewrite path
+            let new_entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                .pending
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .collect();
+
+            // Apply pending insertions to main tree.
+            for (key, value) in self.pending.iter() {
+                self.db.tree_mut().insert(key.to_vec(), value.to_vec());
+            }
+
             // Deletions or updates require a full rewrite.
-            self.db.persist_tree()
+            let result = self.db.persist_tree();
+
+            // Update bloom filter with newly inserted keys on success.
+            if result.is_ok() {
+                for (key, _) in &new_entries {
+                    self.db.bloom_mut().insert(key);
+                }
+            }
+            result
         } else {
             // Append-only: use incremental persist for massive speedup.
-            self.db.persist_incremental(
-                new_entries.iter().map(|(k, v)| (k.as_slice(), v.as_slice())),
+            // First persist using references to avoid cloning for I/O.
+            let result = self.db.persist_incremental(
+                self.pending.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
                 false,
-            )
+            );
+
+            if result.is_ok() {
+                // Apply pending insertions to main tree and update bloom filter.
+                // Note: We have to clone here because BTree.iter() returns references.
+                // A future optimization would be to use a consuming iterator.
+                for (key, value) in self.pending.iter() {
+                    self.db.bloom_mut().insert(key);
+                    self.db.tree_mut().insert(key.to_vec(), value.to_vec());
+                }
+            }
+            result
         };
 
         match persist_result {
             Ok(()) => {
-                // Update bloom filter with newly inserted keys.
-                for (key, _) in &new_entries {
-                    self.db.bloom_mut().insert(key);
-                }
                 self.committed = true;
                 Ok(())
             }
