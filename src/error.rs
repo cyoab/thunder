@@ -96,8 +96,73 @@ pub enum Error {
     },
     /// Database is already open.
     DatabaseAlreadyOpen,
+    /// Page size mismatch when opening existing database.
+    PageSizeMismatch {
+        expected: u32,
+        actual: u32,
+    },
     /// Generic I/O error (legacy, prefer specific variants).
     Io(io::Error),
+
+    // ==================== Phase 3: I/O Stack Errors ====================
+
+    /// io_uring initialization failed.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    IoUringInit {
+        context: &'static str,
+        source: io::Error,
+    },
+
+    /// io_uring submission failed.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    IoUringSubmit {
+        context: &'static str,
+        source: io::Error,
+    },
+
+    /// io_uring completion reported error.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    IoUringCompletion {
+        context: &'static str,
+        errno: i32,
+    },
+
+    /// io_uring submission queue full.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    IoUringQueueFull,
+
+    /// Direct I/O alignment error.
+    DirectIoAlignment {
+        offset: u64,
+        len: usize,
+        required_alignment: usize,
+    },
+
+    // ==================== Phase 4: WAL & Checkpoint Errors ====================
+
+    /// WAL segment corrupted.
+    WalCorrupted {
+        segment_id: u64,
+        offset: u64,
+        reason: String,
+    },
+
+    /// WAL record invalid or corrupted.
+    WalRecordInvalid {
+        lsn: u64,
+        reason: String,
+    },
+
+    /// Checkpoint operation failed.
+    CheckpointFailed {
+        lsn: u64,
+        reason: String,
+    },
+
+    /// Group commit operation failed.
+    GroupCommitFailed {
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -164,7 +229,51 @@ impl fmt::Display for Error {
                 write!(f, "invalid bucket name: {reason}")
             }
             Error::DatabaseAlreadyOpen => write!(f, "database is already open"),
+            Error::PageSizeMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "page size mismatch: expected {expected} bytes, found {actual} bytes"
+                )
+            }
             Error::Io(err) => write!(f, "I/O error: {err}"),
+
+            // Phase 3: I/O Stack Errors
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            Error::IoUringInit { context, source } => {
+                write!(f, "io_uring initialization failed ({context}): {source}")
+            }
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            Error::IoUringSubmit { context, source } => {
+                write!(f, "io_uring submission failed ({context}): {source}")
+            }
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            Error::IoUringCompletion { context, errno } => {
+                write!(f, "io_uring completion error ({context}): errno {errno}")
+            }
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            Error::IoUringQueueFull => {
+                write!(f, "io_uring submission queue full")
+            }
+            Error::DirectIoAlignment { offset, len, required_alignment } => {
+                write!(
+                    f,
+                    "direct I/O alignment error: offset {offset}, len {len} must be aligned to {required_alignment}"
+                )
+            }
+
+            // Phase 4: WAL & Checkpoint Errors
+            Error::WalCorrupted { segment_id, offset, reason } => {
+                write!(f, "WAL corrupted at segment {segment_id}, offset {offset}: {reason}")
+            }
+            Error::WalRecordInvalid { lsn, reason } => {
+                write!(f, "WAL record invalid at LSN {lsn}: {reason}")
+            }
+            Error::CheckpointFailed { lsn, reason } => {
+                write!(f, "checkpoint failed at LSN {lsn}: {reason}")
+            }
+            Error::GroupCommitFailed { reason } => {
+                write!(f, "group commit failed: {reason}")
+            }
         }
     }
 }
@@ -183,6 +292,10 @@ impl std::error::Error for Error {
                 source.as_ref().map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
             }
             Error::Io(err) => Some(err),
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            Error::IoUringInit { source, .. } => Some(source),
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            Error::IoUringSubmit { source, .. } => Some(source),
             _ => None,
         }
     }

@@ -1,6 +1,8 @@
 //! Integration tests for Thunder database.
 //! These tests only use the public API.
 
+#![allow(clippy::drop_non_drop)] // Explicit drops for test clarity
+
 use std::fs;
 use thunder::{Database, Error};
 

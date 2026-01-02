@@ -31,8 +31,46 @@ impl<'db> ReadTx<'db> {
     /// Retrieves the value associated with the given key.
     ///
     /// Returns `None` if the key does not exist.
+    ///
+    /// # Note
+    ///
+    /// This method clones the value. For zero-copy access, use [`get_ref()`](Self::get_ref).
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        // Fast path: bloom filter says key definitely not present.
+        if !self.db.may_contain_key(key) {
+            return None;
+        }
         self.db.tree().get(key).map(|v| v.to_vec())
+    }
+
+    /// Retrieves a reference to the value associated with the given key.
+    ///
+    /// Returns `None` if the key does not exist.
+    ///
+    /// # Zero-Copy
+    ///
+    /// Unlike [`get()`](Self::get), this method returns a reference to the value
+    /// without copying. The reference is valid for the lifetime of the transaction.
+    ///
+    /// Use this method when you need to read large values or when you want to
+    /// avoid allocation overhead.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let rtx = db.read_tx();
+    /// if let Some(value) = rtx.get_ref(b"large_key") {
+    ///     // value is a &[u8], no allocation occurred
+    ///     println!("value length: {}", value.len());
+    /// }
+    /// ```
+    #[inline]
+    pub fn get_ref(&self, key: &[u8]) -> Option<&[u8]> {
+        // Fast path: bloom filter says key definitely not present.
+        if !self.db.may_contain_key(key) {
+            return None;
+        }
+        self.db.tree().get(key)
     }
 
     /// Returns a read-only reference to a bucket.
@@ -427,6 +465,10 @@ impl<'db> WriteTx<'db> {
         let insertion_count = self.pending.len();
         let has_deletions = !self.deleted.is_empty();
 
+        // Check if any pending writes are updates to existing keys
+        // Updates require full rewrite (especially for overflow values)
+        let has_updates = self.pending.iter().any(|(k, _)| self.db.tree().get(k).is_some());
+
         // Apply deletions to main tree.
         for key in &self.deleted {
             self.db.tree_mut().remove(key);
@@ -445,9 +487,10 @@ impl<'db> WriteTx<'db> {
             self.db.tree_mut().insert(key.to_vec(), value.to_vec());
         }
 
-        // Use incremental persist for insert-only workloads.
-        let persist_result = if has_deletions {
-            // Deletions require a full rewrite (or future: lazy compaction).
+        // Use incremental persist only for pure insert workloads.
+        // Updates and deletions require a full rewrite.
+        let persist_result = if has_deletions || has_updates {
+            // Deletions or updates require a full rewrite.
             self.db.persist_tree()
         } else {
             // Append-only: use incremental persist for massive speedup.
@@ -459,6 +502,10 @@ impl<'db> WriteTx<'db> {
 
         match persist_result {
             Ok(()) => {
+                // Update bloom filter with newly inserted keys.
+                for (key, _) in &new_entries {
+                    self.db.bloom_mut().insert(key);
+                }
                 self.committed = true;
                 Ok(())
             }

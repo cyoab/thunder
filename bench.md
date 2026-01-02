@@ -3,6 +3,7 @@
 ## Raw Results
 
 ### Thunder (Rust)
+
 | Benchmark | Time | Throughput |
 |-----------|------|------------|
 | Sequential writes (100K keys, 1 tx) | 138ms | 722,672 ops/sec |
@@ -17,6 +18,7 @@
 | Large values (1MB x 100) | 438ms | 228.3 MB/sec |
 
 ### BBolt (Go)
+
 | Benchmark | Time | Throughput |
 |-----------|------|------------|
 | Sequential writes (100K keys, 1 tx) | 332ms | 300,907 ops/sec |

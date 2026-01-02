@@ -123,7 +123,7 @@ impl Mmap {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
-    /// Returns a slice of a specific page.
+    /// Returns a slice of a specific page using the default page size.
     ///
     /// # Arguments
     ///
@@ -134,17 +134,58 @@ impl Mmap {
     /// `None` if the page is out of bounds.
     #[inline]
     pub fn page(&self, page_id: u64) -> Option<&[u8]> {
-        let offset = page_id as usize * PAGE_SIZE;
-        if offset + PAGE_SIZE > self.len {
+        self.page_with_size(page_id, PAGE_SIZE)
+    }
+
+    /// Returns a slice of a specific page with a given page size.
+    ///
+    /// # Arguments
+    ///
+    /// * `page_id` - The page number (0-indexed).
+    /// * `page_size` - The page size in bytes.
+    ///
+    /// # Returns
+    ///
+    /// `None` if the page is out of bounds.
+    #[inline]
+    pub fn page_with_size(&self, page_id: u64, page_size: usize) -> Option<&[u8]> {
+        let offset = page_id as usize * page_size;
+        let end = offset.checked_add(page_size)?;
+        if end > self.len {
             return None;
         }
-        Some(&self.as_slice()[offset..offset + PAGE_SIZE])
+        Some(&self.as_slice()[offset..end])
+    }
+
+    /// Returns a slice at a specific byte offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Byte offset into the mapped region.
+    /// * `len` - Number of bytes to return.
+    ///
+    /// # Returns
+    ///
+    /// `None` if the range is out of bounds.
+    #[inline]
+    pub fn slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        Some(&self.as_slice()[offset..end])
     }
 
     /// Returns the number of complete pages in the mapped region.
     #[inline]
     pub fn page_count(&self) -> u64 {
         (self.len / PAGE_SIZE) as u64
+    }
+
+    /// Returns the number of complete pages with a given page size.
+    #[inline]
+    pub fn page_count_with_size(&self, page_size: usize) -> u64 {
+        (self.len / page_size) as u64
     }
 }
 
@@ -219,6 +260,49 @@ mod tests {
 
         // Out of bounds
         assert!(mmap.page(4).is_none());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_mmap_page_with_size() {
+        let path = test_file_path("page_size");
+        cleanup(&path);
+
+        let file = create_test_file(&path, 4); // 4 * 4KB = 16KB
+        let mmap = Mmap::new(&file, 4 * PAGE_SIZE).expect("mmap should succeed");
+
+        // Access as 8KB pages (2 pages)
+        assert_eq!(mmap.page_count_with_size(8192), 2);
+        let page0 = mmap.page_with_size(0, 8192).expect("page should exist");
+        assert_eq!(page0.len(), 8192);
+
+        // Access as 16KB pages (1 page)
+        assert_eq!(mmap.page_count_with_size(16384), 1);
+        let page0_large = mmap.page_with_size(0, 16384).expect("page should exist");
+        assert_eq!(page0_large.len(), 16384);
+
+        // Out of bounds with larger page size
+        assert!(mmap.page_with_size(1, 16384).is_none());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_mmap_slice() {
+        let path = test_file_path("slice");
+        cleanup(&path);
+
+        let file = create_test_file(&path, 2);
+        let mmap = Mmap::new(&file, 2 * PAGE_SIZE).expect("mmap should succeed");
+
+        // Valid slice
+        let slice = mmap.slice(100, 200).expect("slice should exist");
+        assert_eq!(slice.len(), 200);
+
+        // Out of bounds
+        assert!(mmap.slice(2 * PAGE_SIZE - 50, 100).is_none());
+        assert!(mmap.slice(usize::MAX, 10).is_none());
 
         cleanup(&path);
     }

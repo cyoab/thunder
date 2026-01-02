@@ -2,17 +2,110 @@
 //! Copyright (c) YOAB. All rights reserved.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+use crate::bloom::BloomFilter;
 use crate::btree::BTree;
+use crate::checkpoint::{CheckpointConfig, CheckpointInfo, CheckpointManager};
+use crate::coalescer::WriteCoalescer;
 use crate::error::{Error, Result};
 use crate::meta::Meta;
-use crate::page::PAGE_SIZE;
+use crate::mmap::Mmap;
+use crate::overflow::{OverflowManager, OverflowRef, DEFAULT_OVERFLOW_THRESHOLD};
+use crate::page::{PageId, PageSizeConfig, PAGE_SIZE};
 use crate::tx::{ReadTx, WriteTx};
+use crate::wal::{Lsn, SyncPolicy, Wal, WalConfig};
+use crate::wal_record::WalRecord;
+
+/// Default write buffer size (256KB).
+/// Larger buffers reduce syscall overhead for batch writes.
+const WRITE_BUFFER_SIZE: usize = 256 * 1024;
+
+/// Default expected keys for bloom filter sizing.
+const DEFAULT_BLOOM_EXPECTED_KEYS: usize = 100_000;
+
+/// Default bloom filter false positive rate (1%).
+const DEFAULT_BLOOM_FP_RATE: f64 = 0.01;
+
+/// Result type for load_tree: (tree, data_end_offset, entry_count, bloom_filter, overflow_refs)
+type TreeLoadResult = (BTree, u64, u64, BloomFilter, std::collections::HashMap<Vec<u8>, OverflowRef>);
+
+/// Database configuration options.
+///
+/// Allows customizing page size, overflow threshold, write buffer behavior,
+/// and WAL/checkpoint settings.
+#[derive(Debug, Clone)]
+pub struct DatabaseOptions {
+    /// Page size for new databases.
+    /// Ignored when opening existing databases (uses stored value).
+    pub page_size: PageSizeConfig,
+    /// Overflow threshold (values larger than this use overflow pages).
+    pub overflow_threshold: usize,
+    /// Write buffer size for the coalescer.
+    pub write_buffer_size: usize,
+    // Phase 4: WAL & Checkpoint options
+    /// Enable write-ahead logging for durability.
+    pub wal_enabled: bool,
+    /// Directory for WAL files. If None, uses `<db_path>.wal/`.
+    pub wal_dir: Option<PathBuf>,
+    /// WAL sync policy.
+    pub wal_sync_policy: SyncPolicy,
+    /// WAL segment size in bytes.
+    pub wal_segment_size: u64,
+    /// Checkpoint interval in seconds. 0 disables automatic checkpointing.
+    pub checkpoint_interval_secs: u64,
+    /// WAL size threshold for checkpoint (bytes).
+    pub checkpoint_wal_threshold: usize,
+}
+
+impl Default for DatabaseOptions {
+    fn default() -> Self {
+        Self {
+            page_size: PageSizeConfig::Size4K,
+            overflow_threshold: DEFAULT_OVERFLOW_THRESHOLD,
+            write_buffer_size: WRITE_BUFFER_SIZE,
+            wal_enabled: false,
+            wal_dir: None,
+            wal_sync_policy: SyncPolicy::default(),
+            wal_segment_size: 64 * 1024 * 1024, // 64MB
+            checkpoint_interval_secs: 300,       // 5 minutes
+            checkpoint_wal_threshold: 128 * 1024 * 1024, // 128MB
+        }
+    }
+}
+
+impl DatabaseOptions {
+    /// Configuration optimized for NVMe storage.
+    ///
+    /// Uses larger page sizes and buffers for better NVMe performance.
+    pub fn nvme_optimized() -> Self {
+        Self {
+            page_size: PageSizeConfig::Size16K,
+            overflow_threshold: 4096, // 4KB threshold
+            write_buffer_size: 1024 * 1024, // 1MB buffer
+            wal_enabled: false,
+            wal_dir: None,
+            wal_sync_policy: SyncPolicy::default(),
+            wal_segment_size: 64 * 1024 * 1024,
+            checkpoint_interval_secs: 300,
+            checkpoint_wal_threshold: 128 * 1024 * 1024,
+        }
+    }
+
+    /// Configuration with WAL enabled for durability.
+    ///
+    /// Enables write-ahead logging with default settings.
+    pub fn with_wal() -> Self {
+        Self {
+            wal_enabled: true,
+            ..Self::default()
+        }
+    }
+}
 
 /// The main database handle.
 ///
@@ -25,7 +118,7 @@ use crate::tx::{ReadTx, WriteTx};
 /// - Only one write transaction can be active at a time.
 pub struct Database {
     /// Path to the database file.
-    path: std::path::PathBuf,
+    path: PathBuf,
     /// The underlying file handle.
     file: File,
     /// Current meta page (the one with higher txid).
@@ -36,6 +129,26 @@ pub struct Database {
     data_end_offset: u64,
     /// Number of entries currently persisted.
     persisted_entry_count: u64,
+    /// Memory-mapped view of the database file (optional).
+    /// Used for efficient read access to committed data.
+    #[cfg(unix)]
+    mmap: Option<Mmap>,
+    /// Bloom filter for fast negative lookups.
+    /// Returns false = definitely not present, true = possibly present.
+    bloom: BloomFilter,
+    /// Effective page size for this database.
+    page_size: usize,
+    /// Database options.
+    options: DatabaseOptions,
+    /// Overflow page manager.
+    overflow_manager: OverflowManager,
+    /// Maps keys to their overflow references (for large values).
+    overflow_refs: std::collections::HashMap<Vec<u8>, OverflowRef>,
+    // Phase 4: WAL & Checkpoint fields
+    /// Write-ahead log (if enabled).
+    wal: Option<Wal>,
+    /// Checkpoint manager (if WAL enabled).
+    checkpoint_manager: Option<CheckpointManager>,
 }
 
 impl Database {
@@ -48,6 +161,21 @@ impl Database {
     /// Returns an error if the file cannot be opened or created,
     /// or if the database file is corrupted.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_options(path, DatabaseOptions::default())
+    }
+
+    /// Opens a database at the given path with custom options.
+    ///
+    /// For new databases, the configured page size is used.
+    /// For existing databases, the stored page size is used (options.page_size is ignored).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file cannot be opened or created
+    /// - The database file is corrupted
+    /// - Page size mismatch (existing database has different page size than expected)
+    pub fn open_with_options<P: AsRef<Path>>(path: P, options: DatabaseOptions) -> Result<Self> {
         let path = path.as_ref();
         let path_buf = path.to_path_buf();
 
@@ -80,17 +208,130 @@ impl Database {
             }
         };
 
-        let (meta, tree, data_end_offset, persisted_entry_count) = if file_exists && file_len > 0 {
-            // Existing database: read and validate meta pages, load data.
-            let meta = Self::load_meta(&mut file, &path_buf)?;
-            let (tree, data_end, count) = Self::load_tree(&mut file, &meta)?;
-            (meta, tree, data_end, count)
+        let (meta, mut tree, data_end_offset, persisted_entry_count, bloom, page_size, overflow_refs) =
+            if file_exists && file_len > 0 {
+                // Existing database: read and validate meta pages, load data.
+                let meta = Self::load_meta(&mut file, &path_buf)?;
+
+                // For existing databases, check if page size is valid
+                let stored_page_size = meta.page_size as usize;
+                if PageSizeConfig::from_u32(meta.page_size).is_none() {
+                    return Err(Error::Corrupted {
+                        context: "loading meta page",
+                        details: format!("invalid page size: {}", meta.page_size),
+                    });
+                }
+
+                // Check for page size mismatch
+                let expected_page_size = options.page_size.as_usize();
+                if stored_page_size != expected_page_size {
+                    return Err(Error::PageSizeMismatch {
+                        expected: expected_page_size as u32,
+                        actual: stored_page_size as u32,
+                    });
+                }
+
+                let (tree, data_end, count, bloom, overflow_refs) =
+                    Self::load_tree(&mut file, &meta, stored_page_size, options.overflow_threshold)?;
+                (meta, tree, data_end, count, bloom, stored_page_size, overflow_refs)
+            } else {
+                // New database: initialize with two meta pages.
+                let page_size = options.page_size.as_usize();
+                let meta = Self::init_db(&mut file, &path_buf, page_size)?;
+                let data_offset = 2 * PAGE_SIZE as u64 + 8; // After meta pages + entry count
+                let bloom = BloomFilter::new(DEFAULT_BLOOM_EXPECTED_KEYS, DEFAULT_BLOOM_FP_RATE);
+                (meta, BTree::new(), data_offset, 0, bloom, page_size, std::collections::HashMap::new())
+            };
+
+        // Calculate next page ID for overflow manager
+        let next_overflow_page = Self::calculate_next_overflow_page(data_end_offset, page_size);
+
+        // Initialize mmap for efficient read access (Unix only).
+        #[cfg(unix)]
+        let mmap = Self::init_mmap(&file);
+
+        // Initialize WAL if enabled
+        let (wal, checkpoint_manager) = if options.wal_enabled {
+            let wal_dir = options.wal_dir.clone().unwrap_or_else(|| {
+                let mut wal_path = path_buf.clone();
+                wal_path.set_extension("wal");
+                wal_path
+            });
+
+            let wal_config = WalConfig {
+                segment_size: options.wal_segment_size,
+                sync_policy: options.wal_sync_policy,
+            };
+
+            let wal = Wal::open(&wal_dir, wal_config)?;
+
+            // Initialize checkpoint manager
+            let ckpt_config = CheckpointConfig {
+                interval: std::time::Duration::from_secs(options.checkpoint_interval_secs),
+                wal_threshold: options.checkpoint_wal_threshold,
+                min_records: 10_000,
+            };
+
+            let ckpt_mgr = if meta.checkpoint_lsn > 0 {
+                CheckpointManager::restore(ckpt_config, meta.checkpoint_info())
+            } else {
+                CheckpointManager::new(ckpt_config)
+            };
+
+            (Some(wal), Some(ckpt_mgr))
         } else {
-            // New database: initialize with two meta pages.
-            let meta = Self::init_db(&mut file, &path_buf)?;
-            let data_offset = 2 * PAGE_SIZE as u64 + 8; // After meta pages + entry count
-            (meta, BTree::new(), data_offset, 0)
+            (None, None)
         };
+
+        // Replay WAL from checkpoint if needed (after creating wal/ckpt_mgr)
+        if let Some(ref wal) = wal {
+            let replay_from = meta.checkpoint_lsn;
+            if wal.current_lsn() > replay_from {
+                let mut committed_txids = std::collections::HashSet::new();
+                let mut txn_ops: std::collections::HashMap<u64, Vec<WalRecord>> =
+                    std::collections::HashMap::new();
+                let mut current_txid = None;
+
+                wal.replay(replay_from, |record| {
+                    match &record {
+                        WalRecord::TxBegin { txid } => {
+                            current_txid = Some(*txid);
+                            txn_ops.insert(*txid, Vec::new());
+                        }
+                        WalRecord::Put { .. } | WalRecord::Delete { .. } => {
+                            if let Some(txid) = current_txid {
+                                txn_ops.entry(txid).or_default().push(record);
+                            }
+                        }
+                        WalRecord::TxCommit { txid } => {
+                            committed_txids.insert(*txid);
+                        }
+                        WalRecord::TxAbort { txid } => {
+                            txn_ops.remove(txid);
+                        }
+                        WalRecord::Checkpoint { .. } => {}
+                    }
+                    Ok(())
+                })?;
+
+                // Apply only committed transactions
+                for txid in committed_txids {
+                    if let Some(ops) = txn_ops.get(&txid) {
+                        for op in ops {
+                            match op {
+                                WalRecord::Put { key, value } => {
+                                    tree.insert(key.clone(), value.clone());
+                                }
+                                WalRecord::Delete { key } => {
+                                    tree.remove(key);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             path: path_buf,
@@ -99,12 +340,95 @@ impl Database {
             tree,
             data_end_offset,
             persisted_entry_count,
+            #[cfg(unix)]
+            mmap,
+            bloom,
+            page_size,
+            options,
+            overflow_manager: OverflowManager::new(page_size, next_overflow_page),
+            overflow_refs,
+            wal,
+            checkpoint_manager,
         })
     }
 
+    /// Calculates the next available page ID for overflow pages.
+    fn calculate_next_overflow_page(data_end_offset: u64, page_size: usize) -> PageId {
+        // Overflow pages start after the data section
+        // Round up to next page boundary
+        let page_size_u64 = page_size as u64;
+        data_end_offset.div_ceil(page_size_u64) + 1
+    }
+
+    /// Initializes the memory mapping for the database file.
+    #[cfg(unix)]
+    fn init_mmap(file: &File) -> Option<Mmap> {
+        let file_len = file.metadata().ok()?.len() as usize;
+        // Only mmap if file has data beyond meta pages
+        if file_len > 2 * PAGE_SIZE {
+            Mmap::new(file, file_len).ok()
+        } else {
+            None
+        }
+    }
+
+    /// Refreshes the memory mapping after file size changes.
+    #[cfg(unix)]
+    fn refresh_mmap(&mut self) -> Result<()> {
+        let file_len = self.file.metadata().map_err(|e| Error::FileMetadata {
+            path: self.path.clone(),
+            source: e,
+        })?.len() as usize;
+
+        if file_len > 2 * PAGE_SIZE {
+            self.mmap = Mmap::new(&self.file, file_len).ok();
+        }
+        Ok(())
+    }
+
+    /// Returns a slice of the memory-mapped file at the given offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Byte offset into the file.
+    /// * `len` - Number of bytes to read.
+    ///
+    /// # Returns
+    ///
+    /// `None` if mmap is not available or the range is out of bounds.
+    #[cfg(unix)]
+    pub fn mmap_slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let mmap = self.mmap.as_ref()?;
+        let start = offset as usize;
+        let end = start.checked_add(len)?;
+        if end <= mmap.len() {
+            Some(&mmap.as_slice()[start..end])
+        } else {
+            None
+        }
+    }
+
+    /// Returns a slice of the memory-mapped file (stub for non-Unix).
+    #[cfg(not(unix))]
+    pub fn mmap_slice(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
+
+    /// Returns the page size for this database.
+    #[inline]
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// Returns the overflow threshold for this database.
+    #[inline]
+    pub fn overflow_threshold(&self) -> usize {
+        self.options.overflow_threshold
+    }
+
     /// Initializes a new database file with two meta pages.
-    fn init_db(file: &mut File, path: &std::path::PathBuf) -> Result<Meta> {
-        let meta = Meta::new();
+    fn init_db(file: &mut File, path: &std::path::PathBuf, page_size: usize) -> Result<Meta> {
+        let meta = Meta::with_page_size(page_size as u32);
         let meta_bytes = meta.to_bytes();
 
         // Seek to beginning of file.
@@ -247,8 +571,14 @@ impl Database {
     }
 
     /// Loads the B+ tree data from the database file.
-    fn load_tree(file: &mut File, meta: &Meta) -> Result<(BTree, u64, u64)> {
+    fn load_tree(
+        file: &mut File,
+        meta: &Meta,
+        page_size: usize,
+        _overflow_threshold: usize,
+    ) -> Result<TreeLoadResult> {
         let mut tree = BTree::new();
+        let mut overflow_refs = std::collections::HashMap::new();
 
         // Data starts after the two meta pages.
         let data_offset = 2 * PAGE_SIZE as u64;
@@ -256,7 +586,8 @@ impl Database {
         // Read the data page count from meta.
         if meta.root == 0 {
             // No data stored yet.
-            return Ok((tree, data_offset + 8, 0));
+            let bloom = BloomFilter::new(DEFAULT_BLOOM_EXPECTED_KEYS, DEFAULT_BLOOM_FP_RATE);
+            return Ok((tree, data_offset + 8, 0, bloom, overflow_refs));
         }
 
         // Seek to data section.
@@ -272,7 +603,8 @@ impl Database {
         let mut count_buf = [0u8; 8];
         if file.read_exact(&mut count_buf).is_err() {
             // No data section yet - this is OK for empty databases.
-            return Ok((tree, data_offset + 8, 0));
+            let bloom = BloomFilter::new(DEFAULT_BLOOM_EXPECTED_KEYS, DEFAULT_BLOOM_FP_RATE);
+            return Ok((tree, data_offset + 8, 0, bloom, overflow_refs));
         }
         let entry_count = u64::from_le_bytes(count_buf);
 
@@ -289,6 +621,9 @@ impl Database {
 
         // Track current position for computing end offset.
         let mut current_offset = data_offset + 8;
+
+        // Create overflow manager for reading overflow values
+        let overflow_manager = OverflowManager::new(page_size, 0);
 
         // Read each entry.
         for entry_idx in 0..entry_count {
@@ -326,7 +661,7 @@ impl Database {
             }
             current_offset += key_len as u64;
 
-            // Read value length.
+            // Read value length (or overflow marker).
             if let Err(e) = file.read_exact(&mut len_buf) {
                 return Err(Error::EntryReadFailed {
                     entry_index: entry_idx,
@@ -334,35 +669,86 @@ impl Database {
                     source: e,
                 });
             }
-            let value_len = u32::from_le_bytes(len_buf) as usize;
+            let value_len = u32::from_le_bytes(len_buf);
             current_offset += 4;
 
-            // Validate value length.
-            const MAX_VALUE_LEN: usize = 512 * 1024 * 1024; // 512MB max value.
-            if value_len > MAX_VALUE_LEN {
-                return Err(Error::Corrupted {
-                    context: "loading entry value",
-                    details: format!(
-                        "entry {entry_idx}: value length {value_len} exceeds maximum {MAX_VALUE_LEN}"
-                    ),
-                });
-            }
+            let value = if value_len == OverflowRef::MARKER {
+                // Read overflow reference
+                let mut oref_buf = [0u8; OverflowRef::SIZE];
+                if let Err(e) = file.read_exact(&mut oref_buf) {
+                    return Err(Error::EntryReadFailed {
+                        entry_index: entry_idx,
+                        field: "overflow reference",
+                        source: e,
+                    });
+                }
+                current_offset += OverflowRef::SIZE as u64;
 
-            // Read value.
-            let mut value = vec![0u8; value_len];
-            if let Err(e) = file.read_exact(&mut value) {
-                return Err(Error::EntryReadFailed {
-                    entry_index: entry_idx,
-                    field: "value data",
-                    source: e,
-                });
-            }
-            current_offset += value_len as u64;
+                let oref = OverflowRef::from_bytes(&oref_buf).ok_or_else(|| Error::Corrupted {
+                    context: "loading overflow reference",
+                    details: format!("entry {entry_idx}: invalid overflow reference"),
+                })?;
+
+                // Read overflow value from file
+                let value = overflow_manager.read_overflow_from_file(oref, file).ok_or_else(|| {
+                    Error::Corrupted {
+                        context: "reading overflow value",
+                        details: format!("entry {entry_idx}: failed to read overflow chain"),
+                    }
+                })?;
+
+                // Store the overflow reference for later
+                overflow_refs.insert(key.clone(), oref);
+
+                // Seek back to continue reading entries
+                if let Err(e) = file.seek(SeekFrom::Start(current_offset)) {
+                    return Err(Error::FileSeek {
+                        offset: current_offset,
+                        context: "seeking after overflow read",
+                        source: e,
+                    });
+                }
+
+                value
+            } else {
+                // Validate inline value length.
+                let value_len = value_len as usize;
+                const MAX_VALUE_LEN: usize = 512 * 1024 * 1024; // 512MB max value.
+                if value_len > MAX_VALUE_LEN {
+                    return Err(Error::Corrupted {
+                        context: "loading entry value",
+                        details: format!(
+                            "entry {entry_idx}: value length {value_len} exceeds maximum {MAX_VALUE_LEN}"
+                        ),
+                    });
+                }
+
+                // Read inline value.
+                let mut value = vec![0u8; value_len];
+                if let Err(e) = file.read_exact(&mut value) {
+                    return Err(Error::EntryReadFailed {
+                        entry_index: entry_idx,
+                        field: "value data",
+                        source: e,
+                    });
+                }
+                current_offset += value_len as u64;
+
+                value
+            };
 
             tree.insert(key, value);
         }
 
-        Ok((tree, current_offset, entry_count))
+        // Build bloom filter from loaded keys.
+        // Use entry_count to size the filter appropriately.
+        let bloom_size = (entry_count as usize).max(DEFAULT_BLOOM_EXPECTED_KEYS);
+        let mut bloom = BloomFilter::new(bloom_size, DEFAULT_BLOOM_FP_RATE);
+        for (key, _) in tree.iter() {
+            bloom.insert(key);
+        }
+
+        Ok((tree, current_offset, entry_count, bloom, overflow_refs))
     }
 
     /// Persists the B+ tree data to the database file.
@@ -371,92 +757,97 @@ impl Database {
         // Data starts after the two meta pages.
         let data_offset = 2 * PAGE_SIZE as u64;
 
-        // Seek to data section.
-        if let Err(e) = self.file.seek(SeekFrom::Start(data_offset)) {
-            return Err(Error::FileSeek {
-                offset: data_offset,
-                context: "seeking to data section for persist",
-                source: e,
-            });
+        // Collect all entries and determine which need overflow
+        let entries: Vec<_> = self.tree.iter().collect();
+        let overflow_threshold = self.options.overflow_threshold;
+        let page_size = self.page_size;
+
+        // Create write coalescer
+        let mut coalescer = WriteCoalescer::new(page_size, self.options.write_buffer_size);
+
+        // Prepare entry data and overflow pages
+        let mut entry_buf = Vec::with_capacity(256 * 1024);
+        let mut new_overflow_refs = std::collections::HashMap::new();
+
+        // Write entry count first
+        let entry_count = entries.len() as u64;
+        entry_buf.extend_from_slice(&entry_count.to_le_bytes());
+
+        // First pass: prepare all entry data and collect overflow allocations
+        // We'll compute overflow page positions after we know the total entry data size
+        let mut overflow_values: Vec<(&[u8], &[u8], Vec<u8>)> = Vec::new(); // (key, original_value, needs_overflow)
+
+        for (key, value) in &entries {
+            // Write key length and key
+            entry_buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            entry_buf.extend_from_slice(key);
+
+            if value.len() > overflow_threshold {
+                // Mark for overflow - we'll write the actual reference later
+                overflow_values.push((key, value, Vec::new()));
+                // Placeholder: write overflow marker + empty ref (will be filled in second pass)
+                entry_buf.extend_from_slice(&OverflowRef::MARKER.to_le_bytes());
+                let placeholder_ref = OverflowRef::new(0, value.len() as u32);
+                entry_buf.extend_from_slice(&placeholder_ref.to_bytes());
+            } else {
+                // Write inline value
+                entry_buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                entry_buf.extend_from_slice(value);
+            }
         }
 
-        // Use a buffered writer for better performance.
-        let mut writer = BufWriter::with_capacity(64 * 1024, &self.file);
+        // Calculate where overflow pages will start (after data section)
+        let data_section_end = data_offset + entry_buf.len() as u64;
+        // Align to page boundary
+        let overflow_start = data_section_end.div_ceil(page_size as u64) * page_size as u64;
+        let overflow_start_page = overflow_start / page_size as u64;
 
-        // Write number of entries.
-        let entry_count = self.tree.len() as u64;
-        if let Err(e) = writer.write_all(&entry_count.to_le_bytes()) {
-            return Err(Error::FileWrite {
-                offset: data_offset,
-                len: 8,
-                context: "writing entry count",
-                source: e,
-            });
+        // Reset overflow manager to allocate pages starting from overflow section
+        self.overflow_manager = OverflowManager::new(page_size, overflow_start_page);
+
+        // Second pass: create overflow pages and update references in entry_buf
+        let mut buf_offset = 8; // Skip entry count
+        for (key, value) in &entries {
+            // Skip key length + key
+            buf_offset += 4 + key.len();
+
+            if value.len() > overflow_threshold {
+                // Allocate overflow pages
+                let (oref, overflow_pages) = self.overflow_manager.allocate_overflow(value);
+
+                // Queue overflow pages
+                for (page_id, page_data) in overflow_pages {
+                    coalescer.queue_page(page_id, page_data);
+                }
+
+                // Update the reference in entry_buf
+                buf_offset += 4; // Skip marker
+                entry_buf[buf_offset..buf_offset + 8].copy_from_slice(&oref.start_page.to_le_bytes());
+                entry_buf[buf_offset + 8..buf_offset + 12].copy_from_slice(&oref.total_len.to_le_bytes());
+                buf_offset += 12;
+
+                new_overflow_refs.insert(key.to_vec(), oref);
+            } else {
+                // Skip inline value
+                buf_offset += 4 + value.len();
+            }
         }
 
-        // Track current offset for error reporting.
-        let mut current_offset = data_offset + 8;
+        // Queue entry data
+        coalescer.queue_sequential(&entry_buf);
 
-        // Write each entry.
-        for (key, value) in self.tree.iter() {
-            // Write key length.
-            let key_len_bytes = (key.len() as u32).to_le_bytes();
-            if let Err(e) = writer.write_all(&key_len_bytes) {
-                return Err(Error::FileWrite {
-                    offset: current_offset,
-                    len: 4,
-                    context: "writing key length",
-                    source: e,
-                });
-            }
-            current_offset += 4;
+        // Get the write batch
+        let batch = coalescer.into_write_batch();
 
-            // Write key.
-            if let Err(e) = writer.write_all(key) {
-                return Err(Error::FileWrite {
-                    offset: current_offset,
-                    len: key.len(),
-                    context: "writing key data",
-                    source: e,
-                });
-            }
-            current_offset += key.len() as u64;
+        // Write to file: first sequential data, then overflow pages
+        self.write_batch_to_file_v2(&batch, data_offset)?;
 
-            // Write value length.
-            let value_len_bytes = (value.len() as u32).to_le_bytes();
-            if let Err(e) = writer.write_all(&value_len_bytes) {
-                return Err(Error::FileWrite {
-                    offset: current_offset,
-                    len: 4,
-                    context: "writing value length",
-                    source: e,
-                });
-            }
-            current_offset += 4;
+        // Update overflow refs
+        self.overflow_refs = new_overflow_refs;
 
-            // Write value.
-            if let Err(e) = writer.write_all(value) {
-                return Err(Error::FileWrite {
-                    offset: current_offset,
-                    len: value.len(),
-                    context: "writing value data",
-                    source: e,
-                });
-            }
-            current_offset += value.len() as u64;
-        }
-
-        // Flush the buffered writer.
-        if let Err(e) = writer.flush() {
-            return Err(Error::FileSync {
-                context: "flushing buffered writer",
-                source: e,
-            });
-        }
-        drop(writer);
-
-        // Update tracking info.
-        self.data_end_offset = current_offset;
+        // Calculate new data end offset (just the entry data, not overflow pages)
+        let data_end = data_offset + batch.sequential_data.len() as u64;
+        self.data_end_offset = data_end;
         self.persisted_entry_count = entry_count;
 
         // Update meta page.
@@ -487,6 +878,107 @@ impl Database {
 
         // Use fdatasync instead of fsync for better performance (skips metadata sync).
         Self::fdatasync(&self.file)?;
+
+        // Refresh mmap to reflect new file size.
+        #[cfg(unix)]
+        self.refresh_mmap()?;
+
+        Ok(())
+    }
+
+    /// Writes a batch of data to the file (version 2 with proper overflow handling).
+    fn write_batch_to_file_v2(
+        &mut self,
+        batch: &crate::coalescer::WriteBatch,
+        data_offset: u64,
+    ) -> Result<()> {
+        // Write sequential data first
+        if !batch.sequential_data.is_empty() {
+            if let Err(e) = self.file.seek(SeekFrom::Start(data_offset)) {
+                return Err(Error::FileSeek {
+                    offset: data_offset,
+                    context: "seeking to data section",
+                    source: e,
+                });
+            }
+            if let Err(e) = self.file.write_all(&batch.sequential_data) {
+                return Err(Error::FileWrite {
+                    offset: data_offset,
+                    len: batch.sequential_data.len(),
+                    context: "writing entry data",
+                    source: e,
+                });
+            }
+        }
+
+        // Write overflow pages (sorted by page ID for sequential I/O)
+        for (page_id, data) in &batch.pages {
+            let offset = *page_id * self.page_size as u64;
+            if let Err(e) = self.file.seek(SeekFrom::Start(offset)) {
+                return Err(Error::FileSeek {
+                    offset,
+                    context: "seeking to overflow page",
+                    source: e,
+                });
+            }
+            if let Err(e) = self.file.write_all(data) {
+                return Err(Error::FileWrite {
+                    offset,
+                    len: data.len(),
+                    context: "writing overflow page",
+                    source: e,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Writes a batch of data to the file.
+    #[allow(dead_code)]
+    fn write_batch_to_file(
+        &mut self,
+        batch: &crate::coalescer::WriteBatch,
+        data_offset: u64,
+    ) -> Result<()> {
+        // Write overflow pages first (sorted by page ID for sequential I/O)
+        for (page_id, data) in &batch.pages {
+            let offset = *page_id * self.page_size as u64;
+            if let Err(e) = self.file.seek(SeekFrom::Start(offset)) {
+                return Err(Error::FileSeek {
+                    offset,
+                    context: "seeking to overflow page",
+                    source: e,
+                });
+            }
+            if let Err(e) = self.file.write_all(data) {
+                return Err(Error::FileWrite {
+                    offset,
+                    len: data.len(),
+                    context: "writing overflow page",
+                    source: e,
+                });
+            }
+        }
+
+        // Write sequential data
+        if !batch.sequential_data.is_empty() {
+            if let Err(e) = self.file.seek(SeekFrom::Start(data_offset)) {
+                return Err(Error::FileSeek {
+                    offset: data_offset,
+                    context: "seeking to data section",
+                    source: e,
+                });
+            }
+            if let Err(e) = self.file.write_all(&batch.sequential_data) {
+                return Err(Error::FileWrite {
+                    offset: data_offset,
+                    len: batch.sequential_data.len(),
+                    context: "writing entry data",
+                    source: e,
+                });
+            }
+        }
 
         Ok(())
     }
@@ -523,8 +1015,92 @@ impl Database {
 
         let new_entry_count = entries.len() as u64;
         let total_entry_count = self.persisted_entry_count + new_entry_count;
+        let overflow_threshold = self.options.overflow_threshold;
+        let page_size = self.page_size;
 
-        // Seek to append position.
+        // Create entry data buffer
+        let mut entry_buf = Vec::with_capacity(64 * 1024);
+
+        // First pass: build entry data with placeholder overflow refs
+        for (key, value) in &entries {
+            // Write key length and key
+            entry_buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            entry_buf.extend_from_slice(key);
+
+            if value.len() > overflow_threshold {
+                // Placeholder: write overflow marker + empty ref
+                entry_buf.extend_from_slice(&OverflowRef::MARKER.to_le_bytes());
+                let placeholder_ref = OverflowRef::new(0, value.len() as u32);
+                entry_buf.extend_from_slice(&placeholder_ref.to_bytes());
+            } else {
+                // Write inline value
+                entry_buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                entry_buf.extend_from_slice(value);
+            }
+        }
+
+        // Calculate where new data will end
+        let new_data_end = self.data_end_offset + entry_buf.len() as u64;
+        // Calculate where overflow pages will start
+        let overflow_start = new_data_end.div_ceil(page_size as u64) * page_size as u64;
+        let overflow_start_page = overflow_start / page_size as u64;
+
+        // Update overflow manager
+        self.overflow_manager.set_next_page_id(overflow_start_page);
+
+        // Create coalescer for overflow pages
+        let mut coalescer = WriteCoalescer::new(page_size, self.options.write_buffer_size);
+
+        // Second pass: allocate overflow pages and update refs in entry_buf
+        let mut buf_offset = 0;
+        for (key, value) in &entries {
+            // Skip key length + key
+            buf_offset += 4 + key.len();
+
+            if value.len() > overflow_threshold {
+                // Allocate overflow pages
+                let (oref, overflow_pages) = self.overflow_manager.allocate_overflow(value);
+
+                // Queue overflow pages
+                for (page_id, page_data) in overflow_pages {
+                    coalescer.queue_page(page_id, page_data);
+                }
+
+                // Update the reference in entry_buf
+                buf_offset += 4; // Skip marker
+                entry_buf[buf_offset..buf_offset + 8].copy_from_slice(&oref.start_page.to_le_bytes());
+                entry_buf[buf_offset + 8..buf_offset + 12].copy_from_slice(&oref.total_len.to_le_bytes());
+                buf_offset += 12;
+
+                self.overflow_refs.insert(key.to_vec(), oref);
+            } else {
+                // Skip inline value
+                buf_offset += 4 + value.len();
+            }
+        }
+
+        // Write overflow pages first
+        let batch = coalescer.into_write_batch();
+        for (page_id, data) in &batch.pages {
+            let offset = *page_id * page_size as u64;
+            if let Err(e) = self.file.seek(SeekFrom::Start(offset)) {
+                return Err(Error::FileSeek {
+                    offset,
+                    context: "seeking to overflow page (incremental)",
+                    source: e,
+                });
+            }
+            if let Err(e) = self.file.write_all(data) {
+                return Err(Error::FileWrite {
+                    offset,
+                    len: data.len(),
+                    context: "writing overflow page (incremental)",
+                    source: e,
+                });
+            }
+        }
+
+        // Write entry data at append position
         if let Err(e) = self.file.seek(SeekFrom::Start(self.data_end_offset)) {
             return Err(Error::FileSeek {
                 offset: self.data_end_offset,
@@ -533,67 +1109,14 @@ impl Database {
             });
         }
 
-        // Use a buffered writer for better performance.
-        let mut writer = BufWriter::with_capacity(64 * 1024, &self.file);
-        let mut current_offset = self.data_end_offset;
-
-        // Append new entries.
-        for (key, value) in &entries {
-            // Write key length.
-            let key_len_bytes = (key.len() as u32).to_le_bytes();
-            if let Err(e) = writer.write_all(&key_len_bytes) {
-                return Err(Error::FileWrite {
-                    offset: current_offset,
-                    len: 4,
-                    context: "writing key length (incremental)",
-                    source: e,
-                });
-            }
-            current_offset += 4;
-
-            // Write key.
-            if let Err(e) = writer.write_all(key) {
-                return Err(Error::FileWrite {
-                    offset: current_offset,
-                    len: key.len(),
-                    context: "writing key data (incremental)",
-                    source: e,
-                });
-            }
-            current_offset += key.len() as u64;
-
-            // Write value length.
-            let value_len_bytes = (value.len() as u32).to_le_bytes();
-            if let Err(e) = writer.write_all(&value_len_bytes) {
-                return Err(Error::FileWrite {
-                    offset: current_offset,
-                    len: 4,
-                    context: "writing value length (incremental)",
-                    source: e,
-                });
-            }
-            current_offset += 4;
-
-            // Write value.
-            if let Err(e) = writer.write_all(value) {
-                return Err(Error::FileWrite {
-                    offset: current_offset,
-                    len: value.len(),
-                    context: "writing value data (incremental)",
-                    source: e,
-                });
-            }
-            current_offset += value.len() as u64;
-        }
-
-        // Flush the buffered writer.
-        if let Err(e) = writer.flush() {
-            return Err(Error::FileSync {
-                context: "flushing incremental writer",
+        if let Err(e) = self.file.write_all(&entry_buf) {
+            return Err(Error::FileWrite {
+                offset: self.data_end_offset,
+                len: entry_buf.len(),
+                context: "writing entry data (incremental)",
                 source: e,
             });
         }
-        drop(writer);
 
         // Update entry count at the beginning of data section.
         let data_offset = 2 * PAGE_SIZE as u64;
@@ -614,7 +1137,7 @@ impl Database {
         }
 
         // Update tracking info.
-        self.data_end_offset = current_offset;
+        self.data_end_offset = new_data_end;
         self.persisted_entry_count = total_entry_count;
 
         // Update and sync meta page.
@@ -644,6 +1167,10 @@ impl Database {
 
         // Use fdatasync for better performance.
         Self::fdatasync(&self.file)?;
+
+        // Refresh mmap to reflect new file size.
+        #[cfg(unix)]
+        self.refresh_mmap()?;
 
         Ok(())
     }
@@ -731,6 +1258,29 @@ impl Database {
         &mut self.tree
     }
 
+    /// Returns a reference to the bloom filter.
+    #[allow(dead_code)]
+    pub(crate) fn bloom(&self) -> &BloomFilter {
+        &self.bloom
+    }
+
+    /// Returns a mutable reference to the bloom filter.
+    pub(crate) fn bloom_mut(&mut self) -> &mut BloomFilter {
+        &mut self.bloom
+    }
+
+    /// Checks if a key might exist in the database using the bloom filter.
+    ///
+    /// This is a fast probabilistic check:
+    /// - Returns `false`: The key definitely does NOT exist.
+    /// - Returns `true`: The key MIGHT exist (requires actual lookup to confirm).
+    ///
+    /// Use this for fast-path rejection of negative lookups.
+    #[inline]
+    pub(crate) fn may_contain_key(&self, key: &[u8]) -> bool {
+        self.bloom.may_contain(key)
+    }
+
     /// Begins a new read-only transaction.
     ///
     /// Read transactions provide a consistent snapshot view of the database.
@@ -745,6 +1295,174 @@ impl Database {
     /// The transaction must be committed to persist changes.
     pub fn write_tx(&mut self) -> WriteTx<'_> {
         WriteTx::new(self)
+    }
+
+    // ==================== Phase 4: WAL & Checkpoint Methods ====================
+
+    /// Returns whether WAL is enabled for this database.
+    pub fn wal_enabled(&self) -> bool {
+        self.wal.is_some()
+    }
+
+    /// Returns a mutable reference to the WAL, if enabled.
+    ///
+    /// Reserved for future WAL integration enhancements.
+    #[allow(dead_code)]
+    pub(crate) fn wal_mut(&mut self) -> Option<&mut Wal> {
+        self.wal.as_mut()
+    }
+
+    /// Returns the checkpoint LSN, if WAL is enabled and a checkpoint exists.
+    pub fn checkpoint_lsn(&self) -> Option<Lsn> {
+        if self.meta.checkpoint_lsn > 0 {
+            Some(self.meta.checkpoint_lsn)
+        } else {
+            None
+        }
+    }
+
+    /// Creates a checkpoint.
+    ///
+    /// This persists all data to the main database file and updates the
+    /// checkpoint LSN in the meta page. WAL segments before the checkpoint
+    /// can then be safely truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if WAL is not enabled or if the checkpoint fails.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        // Get checkpoint LSN from WAL
+        let checkpoint_lsn = {
+            let wal = self.wal.as_ref().ok_or_else(|| Error::CheckpointFailed {
+                lsn: 0,
+                reason: "WAL not enabled".to_string(),
+            })?;
+            wal.current_lsn()
+        };
+
+        // Persist all data to main database file
+        self.persist_tree()?;
+
+        // Update meta with checkpoint info
+        let ckpt_info = CheckpointInfo {
+            lsn: checkpoint_lsn,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            entry_count: self.persisted_entry_count,
+        };
+        self.meta.set_checkpoint_info(&ckpt_info);
+
+        // Write meta page
+        let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
+        let meta_offset = meta_page * PAGE_SIZE as u64;
+
+        self.file.seek(SeekFrom::Start(meta_offset)).map_err(|e| Error::FileSeek {
+            offset: meta_offset,
+            context: "seeking to meta page for checkpoint",
+            source: e,
+        })?;
+
+        let meta_bytes = self.meta.to_bytes();
+        self.file.write_all(&meta_bytes).map_err(|e| Error::FileWrite {
+            offset: meta_offset,
+            len: PAGE_SIZE,
+            context: "writing meta page for checkpoint",
+            source: e,
+        })?;
+
+        Self::fdatasync(&self.file)?;
+
+        // Truncate WAL segments before checkpoint
+        if let Some(wal) = &mut self.wal {
+            wal.truncate_before(checkpoint_lsn)?;
+        }
+
+        // Update checkpoint manager
+        if let Some(ckpt_mgr) = &mut self.checkpoint_manager {
+            ckpt_mgr.record_checkpoint(checkpoint_lsn);
+        }
+
+        Ok(())
+    }
+
+    /// Writes a WAL record for a Put operation.
+    ///
+    /// Called by WriteTx during commit when WAL is enabled.
+    /// Reserved for future WAL integration enhancements.
+    #[allow(dead_code)]
+    pub(crate) fn wal_put(&mut self, key: &[u8], value: &[u8]) -> Result<Option<Lsn>> {
+        if let Some(wal) = &mut self.wal {
+            let lsn = wal.append(&WalRecord::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            })?;
+            Ok(Some(lsn))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Writes a WAL record for a Delete operation.
+    ///
+    /// Reserved for future WAL integration enhancements.
+    #[allow(dead_code)]
+    pub(crate) fn wal_delete(&mut self, key: &[u8]) -> Result<Option<Lsn>> {
+        if let Some(wal) = &mut self.wal {
+            let lsn = wal.append(&WalRecord::Delete {
+                key: key.to_vec(),
+            })?;
+            Ok(Some(lsn))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Writes WAL records for transaction begin.
+    ///
+    /// Reserved for future WAL integration enhancements.
+    #[allow(dead_code)]
+    pub(crate) fn wal_tx_begin(&mut self, txid: u64) -> Result<Option<Lsn>> {
+        if let Some(wal) = &mut self.wal {
+            let lsn = wal.append(&WalRecord::TxBegin { txid })?;
+            Ok(Some(lsn))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Writes WAL records for transaction commit.
+    ///
+    /// Reserved for future WAL integration enhancements.
+    #[allow(dead_code)]
+    pub(crate) fn wal_tx_commit(&mut self, txid: u64) -> Result<Option<Lsn>> {
+        if let Some(wal) = &mut self.wal {
+            let lsn = wal.append(&WalRecord::TxCommit { txid })?;
+            wal.sync()?; // Ensure commit is durable
+            Ok(Some(lsn))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Syncs the WAL to disk.
+    ///
+    /// Reserved for future WAL integration enhancements.
+    #[allow(dead_code)]
+    pub(crate) fn wal_sync(&mut self) -> Result<()> {
+        if let Some(wal) = &mut self.wal {
+            wal.sync()?;
+        }
+        Ok(())
+    }
+
+    /// Returns the current transaction ID for WAL purposes.
+    ///
+    /// Reserved for future WAL integration enhancements.
+    #[allow(dead_code)]
+    pub(crate) fn next_txid(&self) -> u64 {
+        self.meta.txid + 1
     }
 }
 
