@@ -32,7 +32,7 @@ pub mod uring;
 pub use aligned::{AlignedBuffer, AlignedBufferPool, DEFAULT_ALIGNMENT};
 pub use arena::{Arena, TypedArena, DEFAULT_ARENA_SIZE};
 pub use btree::{Bound, BTreeIter, BTreeRangeIter};
-pub use bucket::{BucketBound, BucketIter, BucketMut, BucketRangeIter, BucketRef, MAX_BUCKET_NAME_LEN};
+pub use bucket::{BucketBound, BucketIter, BucketMut, BucketRangeIter, BucketRef, NestedBucketRef, NestedBucketIter, MAX_BUCKET_NAME_LEN, MAX_NESTING_DEPTH};
 pub use checkpoint::{CheckpointConfig, CheckpointInfo, CheckpointManager};
 pub use db::{Database, DatabaseOptions};
 pub use error::{Error, Result};

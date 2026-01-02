@@ -1144,3 +1144,342 @@ fn stress_mixed_workload_simulation() {
 
     cleanup(&path);
 }
+
+// ==================== Nested Bucket Tests ====================
+
+#[test]
+fn test_nested_bucket_basic_crud() {
+    let path = test_db_path("nested_bucket_crud");
+    cleanup(&path);
+
+    let mut db = Database::open(&path).expect("open should succeed");
+
+    // Create parent bucket and nested bucket with data
+    {
+        let mut wtx = db.write_tx();
+        wtx.create_bucket(b"parent").unwrap();
+        wtx.create_nested_bucket(b"parent", b"child").unwrap();
+
+        // Put data in parent bucket
+        wtx.bucket_put(b"parent", b"parent_key", b"parent_value").unwrap();
+
+        // Put data in nested bucket
+        wtx.nested_bucket_put(b"parent", b"child", b"child_key", b"child_value").unwrap();
+
+        wtx.commit().expect("commit should succeed");
+    }
+
+    // Read and verify data isolation
+    {
+        let rtx = db.read_tx();
+
+        // Verify parent bucket data
+        let parent = rtx.bucket(b"parent").unwrap();
+        assert_eq!(parent.get(b"parent_key"), Some(&b"parent_value"[..]));
+
+        // Verify nested bucket data
+        let child = rtx.nested_bucket(b"parent", b"child").unwrap();
+        assert_eq!(child.get(b"child_key"), Some(&b"child_value"[..]));
+
+        // Nested bucket key should not be visible in parent
+        assert!(parent.get(b"child_key").is_none());
+    }
+
+    // Update and delete in nested bucket
+    {
+        let mut wtx = db.write_tx();
+        wtx.nested_bucket_put(b"parent", b"child", b"child_key", b"updated_value").unwrap();
+        wtx.nested_bucket_put(b"parent", b"child", b"another_key", b"another_value").unwrap();
+        wtx.commit().expect("commit should succeed");
+    }
+
+    // Verify updates
+    {
+        let rtx = db.read_tx();
+        let child = rtx.nested_bucket(b"parent", b"child").unwrap();
+        assert_eq!(child.get(b"child_key"), Some(&b"updated_value"[..]));
+        assert_eq!(child.get(b"another_key"), Some(&b"another_value"[..]));
+    }
+
+    // Delete nested bucket
+    {
+        let mut wtx = db.write_tx();
+        wtx.delete_nested_bucket(b"parent", b"child").unwrap();
+        wtx.commit().expect("commit should succeed");
+    }
+
+    // Verify nested bucket is gone but parent remains
+    {
+        let rtx = db.read_tx();
+        assert!(rtx.bucket_exists(b"parent"));
+        assert!(!rtx.nested_bucket_exists(b"parent", b"child"));
+
+        let parent = rtx.bucket(b"parent").unwrap();
+        assert_eq!(parent.get(b"parent_key"), Some(&b"parent_value"[..]));
+    }
+
+    cleanup(&path);
+}
+
+#[test]
+fn test_nested_bucket_multi_level_hierarchy() {
+    let path = test_db_path("nested_bucket_hierarchy");
+    cleanup(&path);
+
+    let mut db = Database::open(&path).expect("open should succeed");
+
+    // Create a deep hierarchy: root -> level1 -> level2 -> level3
+    {
+        let mut wtx = db.write_tx();
+        wtx.create_bucket(b"root").unwrap();
+        wtx.create_nested_bucket(b"root", b"level1").unwrap();
+
+        // Create level2 under level1 (path: root/level1/level2)
+        wtx.create_nested_bucket_at_path(&[b"root", b"level1"], b"level2").unwrap();
+
+        // Create level3 under level2 (path: root/level1/level2/level3)
+        wtx.create_nested_bucket_at_path(&[b"root", b"level1", b"level2"], b"level3").unwrap();
+
+        // Insert data at each level
+        wtx.bucket_put(b"root", b"key", b"root_value").unwrap();
+        wtx.nested_bucket_put(b"root", b"level1", b"key", b"level1_value").unwrap();
+        wtx.nested_bucket_put_at_path(&[b"root", b"level1", b"level2"], b"key", b"level2_value").unwrap();
+        wtx.nested_bucket_put_at_path(&[b"root", b"level1", b"level2", b"level3"], b"key", b"level3_value").unwrap();
+
+        wtx.commit().expect("commit should succeed");
+    }
+
+    // Verify data at each level is isolated
+    {
+        let rtx = db.read_tx();
+
+        let root = rtx.bucket(b"root").unwrap();
+        assert_eq!(root.get(b"key"), Some(&b"root_value"[..]));
+
+        let level1 = rtx.nested_bucket(b"root", b"level1").unwrap();
+        assert_eq!(level1.get(b"key"), Some(&b"level1_value"[..]));
+
+        let level2 = rtx.nested_bucket_at_path(&[b"root", b"level1", b"level2"]).unwrap();
+        assert_eq!(level2.get(b"key"), Some(&b"level2_value"[..]));
+
+        let level3 = rtx.nested_bucket_at_path(&[b"root", b"level1", b"level2", b"level3"]).unwrap();
+        assert_eq!(level3.get(b"key"), Some(&b"level3_value"[..]));
+    }
+
+    // Delete intermediate level (level2) should delete level3 as well
+    {
+        let mut wtx = db.write_tx();
+        wtx.delete_nested_bucket_at_path(&[b"root", b"level1"], b"level2").unwrap();
+        wtx.commit().expect("commit should succeed");
+    }
+
+    // Verify level2 and level3 are gone, but root and level1 remain
+    {
+        let rtx = db.read_tx();
+
+        assert!(rtx.bucket_exists(b"root"));
+        assert!(rtx.nested_bucket_exists(b"root", b"level1"));
+        assert!(!rtx.nested_bucket_exists_at_path(&[b"root", b"level1", b"level2"]));
+        assert!(!rtx.nested_bucket_exists_at_path(&[b"root", b"level1", b"level2", b"level3"]));
+
+        // Data at remaining levels should be intact
+        let root = rtx.bucket(b"root").unwrap();
+        assert_eq!(root.get(b"key"), Some(&b"root_value"[..]));
+
+        let level1 = rtx.nested_bucket(b"root", b"level1").unwrap();
+        assert_eq!(level1.get(b"key"), Some(&b"level1_value"[..]));
+    }
+
+    cleanup(&path);
+}
+
+#[test]
+fn test_nested_bucket_sibling_isolation() {
+    let path = test_db_path("nested_bucket_siblings");
+    cleanup(&path);
+
+    let mut db = Database::open(&path).expect("open should succeed");
+
+    // Create multiple sibling nested buckets under same parent
+    {
+        let mut wtx = db.write_tx();
+        wtx.create_bucket(b"parent").unwrap();
+        wtx.create_nested_bucket(b"parent", b"child_a").unwrap();
+        wtx.create_nested_bucket(b"parent", b"child_b").unwrap();
+        wtx.create_nested_bucket(b"parent", b"child_c").unwrap();
+
+        // Same key in each sibling bucket with different values
+        wtx.nested_bucket_put(b"parent", b"child_a", b"shared_key", b"value_a").unwrap();
+        wtx.nested_bucket_put(b"parent", b"child_b", b"shared_key", b"value_b").unwrap();
+        wtx.nested_bucket_put(b"parent", b"child_c", b"shared_key", b"value_c").unwrap();
+
+        wtx.commit().expect("commit should succeed");
+    }
+
+    // Verify each sibling has its own isolated value
+    {
+        let rtx = db.read_tx();
+
+        let child_a = rtx.nested_bucket(b"parent", b"child_a").unwrap();
+        let child_b = rtx.nested_bucket(b"parent", b"child_b").unwrap();
+        let child_c = rtx.nested_bucket(b"parent", b"child_c").unwrap();
+
+        assert_eq!(child_a.get(b"shared_key"), Some(&b"value_a"[..]));
+        assert_eq!(child_b.get(b"shared_key"), Some(&b"value_b"[..]));
+        assert_eq!(child_c.get(b"shared_key"), Some(&b"value_c"[..]));
+
+        // Verify listing nested buckets
+        let nested_buckets = rtx.list_nested_buckets(b"parent").unwrap();
+        assert_eq!(nested_buckets.len(), 3);
+        assert!(nested_buckets.contains(&b"child_a".to_vec()));
+        assert!(nested_buckets.contains(&b"child_b".to_vec()));
+        assert!(nested_buckets.contains(&b"child_c".to_vec()));
+    }
+
+    // Delete one sibling, others should remain
+    {
+        let mut wtx = db.write_tx();
+        wtx.delete_nested_bucket(b"parent", b"child_b").unwrap();
+        wtx.commit().expect("commit should succeed");
+    }
+
+    // Verify deletion didn't affect siblings
+    {
+        let rtx = db.read_tx();
+
+        assert!(rtx.nested_bucket_exists(b"parent", b"child_a"));
+        assert!(!rtx.nested_bucket_exists(b"parent", b"child_b"));
+        assert!(rtx.nested_bucket_exists(b"parent", b"child_c"));
+
+        let child_a = rtx.nested_bucket(b"parent", b"child_a").unwrap();
+        let child_c = rtx.nested_bucket(b"parent", b"child_c").unwrap();
+
+        assert_eq!(child_a.get(b"shared_key"), Some(&b"value_a"[..]));
+        assert_eq!(child_c.get(b"shared_key"), Some(&b"value_c"[..]));
+    }
+
+    cleanup(&path);
+}
+
+#[test]
+fn test_nested_bucket_error_conditions() {
+    let path = test_db_path("nested_bucket_errors");
+    cleanup(&path);
+
+    let mut db = Database::open(&path).expect("open should succeed");
+
+    {
+        let mut wtx = db.write_tx();
+        wtx.create_bucket(b"parent").unwrap();
+        wtx.create_nested_bucket(b"parent", b"child").unwrap();
+
+        // Error: Create nested bucket under non-existent parent
+        assert!(matches!(
+            wtx.create_nested_bucket(b"nonexistent", b"child").unwrap_err(),
+            Error::BucketNotFound { .. }
+        ));
+
+        // Error: Create duplicate nested bucket
+        assert!(matches!(
+            wtx.create_nested_bucket(b"parent", b"child").unwrap_err(),
+            Error::BucketAlreadyExists { .. }
+        ));
+
+        // Error: Invalid nested bucket name (empty)
+        assert!(matches!(
+            wtx.create_nested_bucket(b"parent", b"").unwrap_err(),
+            Error::InvalidBucketName { .. }
+        ));
+
+        // Error: Access non-existent nested bucket
+        assert!(matches!(
+            wtx.nested_bucket_put(b"parent", b"nonexistent", b"k", b"v").unwrap_err(),
+            Error::BucketNotFound { .. }
+        ));
+
+        // Error: Delete non-existent nested bucket
+        assert!(matches!(
+            wtx.delete_nested_bucket(b"parent", b"nonexistent").unwrap_err(),
+            Error::BucketNotFound { .. }
+        ));
+
+        wtx.commit().expect("commit should succeed");
+    }
+
+    // Error: Try to access nested bucket after parent deletion
+    {
+        let mut wtx = db.write_tx();
+        wtx.delete_bucket(b"parent").unwrap();
+        wtx.commit().expect("commit should succeed");
+    }
+
+    {
+        let rtx = db.read_tx();
+        assert!(!rtx.bucket_exists(b"parent"));
+        assert!(!rtx.nested_bucket_exists(b"parent", b"child"));
+    }
+
+    cleanup(&path);
+}
+
+#[test]
+fn test_nested_bucket_persistence() {
+    let path = test_db_path("nested_bucket_persist");
+    cleanup(&path);
+
+    // Create nested bucket structure and persist
+    {
+        let mut db = Database::open(&path).expect("open should succeed");
+        let mut wtx = db.write_tx();
+
+        wtx.create_bucket(b"config").unwrap();
+        wtx.create_nested_bucket(b"config", b"network").unwrap();
+        wtx.create_nested_bucket(b"config", b"storage").unwrap();
+
+        wtx.bucket_put(b"config", b"version", b"1.0").unwrap();
+        wtx.nested_bucket_put(b"config", b"network", b"host", b"localhost").unwrap();
+        wtx.nested_bucket_put(b"config", b"network", b"port", b"8080").unwrap();
+        wtx.nested_bucket_put(b"config", b"storage", b"path", b"/data").unwrap();
+
+        // Create a deeper nesting
+        wtx.create_nested_bucket_at_path(&[b"config", b"storage"], b"options").unwrap();
+        wtx.nested_bucket_put_at_path(&[b"config", b"storage", b"options"], b"compress", b"true").unwrap();
+
+        wtx.commit().expect("commit should succeed");
+    }
+
+    // Reopen database and verify all nested buckets and data persisted
+    {
+        let db = Database::open(&path).expect("reopen should succeed");
+        let rtx = db.read_tx();
+
+        // Check top-level bucket
+        assert!(rtx.bucket_exists(b"config"));
+        let config = rtx.bucket(b"config").unwrap();
+        assert_eq!(config.get(b"version"), Some(&b"1.0"[..]));
+
+        // Check nested buckets
+        assert!(rtx.nested_bucket_exists(b"config", b"network"));
+        assert!(rtx.nested_bucket_exists(b"config", b"storage"));
+
+        let network = rtx.nested_bucket(b"config", b"network").unwrap();
+        assert_eq!(network.get(b"host"), Some(&b"localhost"[..]));
+        assert_eq!(network.get(b"port"), Some(&b"8080"[..]));
+
+        let storage = rtx.nested_bucket(b"config", b"storage").unwrap();
+        assert_eq!(storage.get(b"path"), Some(&b"/data"[..]));
+
+        // Check deeply nested bucket
+        assert!(rtx.nested_bucket_exists_at_path(&[b"config", b"storage", b"options"]));
+        let options = rtx.nested_bucket_at_path(&[b"config", b"storage", b"options"]).unwrap();
+        assert_eq!(options.get(b"compress"), Some(&b"true"[..]));
+
+        // List nested buckets
+        let config_children = rtx.list_nested_buckets(b"config").unwrap();
+        assert_eq!(config_children.len(), 2);
+        assert!(config_children.contains(&b"network".to_vec()));
+        assert!(config_children.contains(&b"storage".to_vec()));
+    }
+
+    cleanup(&path);
+}

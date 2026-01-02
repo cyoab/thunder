@@ -13,6 +13,7 @@ What started as a hobby/learning project has evolved into a capable embedded dat
 - **ACID transactions** — Full durability with crash-safe commits
 - **MVCC** — Multiple concurrent readers, single writer
 - **Buckets** — Logical namespaces for organizing data
+- **Nested buckets** — Hierarchical bucket organization (up to 16 levels deep)
 - **Range queries** — Efficient iteration and range scans
 - **Zero-copy reads** — `get_ref()` API returns references without allocation
 - **Bloom filter** — Fast rejection of non-existent keys (8.5M ops/sec)
@@ -79,11 +80,44 @@ tx.bucket_put(b"posts", b"post1", b"content")?;
 tx.commit()?;
 ```
 
+## Nested Buckets
+
+Create hierarchical bucket structures for complex data organization:
+
+```rust
+let mut tx = db.write_tx();
+
+// Create parent bucket
+tx.create_bucket(b"config")?;
+
+// Create nested buckets
+tx.create_nested_bucket(b"config", b"network")?;
+tx.create_nested_bucket(b"config", b"storage")?;
+
+// Write to nested buckets
+tx.nested_bucket_put(b"config", b"network", b"host", b"localhost")?;
+tx.nested_bucket_put(b"config", b"network", b"port", b"8080")?;
+
+// Create deeply nested buckets (up to 16 levels)
+tx.create_nested_bucket_at_path(&[b"config", b"storage"], b"cache")?;
+tx.nested_bucket_put_at_path(&[b"config", b"storage", b"cache"], b"size", b"1GB")?;
+
+tx.commit()?;
+
+// Read from nested buckets
+let rtx = db.read_tx();
+let network = rtx.nested_bucket(b"config", b"network")?;
+assert_eq!(network.get(b"host"), Some(&b"localhost"[..]));
+
+// List nested buckets
+let children = rtx.list_nested_buckets(b"config")?;
+assert!(children.contains(&b"network".to_vec()));
+```
+
 ## Limitations
 
 Thunder is a hobby project that has grown into something useful, but it has limitations compared to mature solutions:
 
-- **No nested buckets** — Buckets cannot contain other buckets
 - **No cursor API** — Only forward iteration is supported
 - **No compaction** — Deleted data is not reclaimed until full rewrite
 - **Single-threaded writes** — No concurrent write transactions
@@ -146,6 +180,7 @@ cargo run --release --bin thunder_bench
 ## License
 
 MIT
+
 ```
 
 ## License

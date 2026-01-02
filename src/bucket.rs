@@ -13,6 +13,18 @@
 //!
 //! This allows efficient range scans within a bucket while keeping all
 //! data in a single B+ tree.
+//!
+//! # Nested Buckets
+//!
+//! Nested buckets extend this model to support hierarchical bucket structures.
+//! A nested bucket is created within a parent bucket and its keys are prefixed
+//! with the full path of bucket names.
+//!
+//! The format for nested bucket metadata is:
+//! `[NESTED_BUCKET_META_PREFIX][path_component_count][path...]`
+//!
+//! The format for nested bucket data is:
+//! `[NESTED_BUCKET_DATA_PREFIX][path_component_count][path...][user_key]`
 
 use crate::btree::BTree;
 use crate::error::{Error, Result};
@@ -23,8 +35,17 @@ const BUCKET_META_PREFIX: u8 = 0x00;
 /// Magic prefix byte for bucket data entries.
 const BUCKET_DATA_PREFIX: u8 = 0x01;
 
+/// Magic prefix byte for nested bucket metadata entries.
+const NESTED_BUCKET_META_PREFIX: u8 = 0x02;
+
+/// Magic prefix byte for nested bucket data entries.
+const NESTED_BUCKET_DATA_PREFIX: u8 = 0x03;
+
 /// Maximum allowed bucket name length in bytes.
 pub const MAX_BUCKET_NAME_LEN: usize = 255;
+
+/// Maximum nesting depth for buckets.
+pub const MAX_NESTING_DEPTH: usize = 16;
 
 /// Validates a bucket name.
 ///
@@ -197,6 +218,412 @@ pub fn list_buckets(tree: &BTree) -> Vec<Vec<u8>> {
             }
         })
         .collect()
+}
+
+// ==================== Nested Bucket Support ====================
+
+/// Encodes a bucket path into a key prefix.
+///
+/// Format: `[prefix_byte][component_count:u8][len1:u8][name1][len2:u8][name2]...`
+///
+/// This allows nested buckets to be stored with their full path encoded,
+/// enabling proper hierarchical organization and efficient prefix scans.
+#[inline]
+fn encode_path(prefix_byte: u8, path: &[&[u8]]) -> Vec<u8> {
+    let total_len: usize = 2 + path.iter().map(|p| 1 + p.len()).sum::<usize>();
+    let mut key = Vec::with_capacity(total_len);
+    key.push(prefix_byte);
+    key.push(path.len() as u8);
+    for component in path {
+        key.push(component.len() as u8);
+        key.extend_from_slice(component);
+    }
+    key
+}
+
+/// Creates the internal key for nested bucket metadata.
+///
+/// Format: `[NESTED_BUCKET_META_PREFIX][component_count][len1][name1][len2][name2]...`
+#[inline]
+pub fn nested_bucket_meta_key(path: &[&[u8]]) -> Vec<u8> {
+    encode_path(NESTED_BUCKET_META_PREFIX, path)
+}
+
+/// Creates the internal key for a data entry within a nested bucket.
+///
+/// Format: `[NESTED_BUCKET_DATA_PREFIX][component_count][path...][user_key]`
+#[inline]
+pub fn nested_bucket_data_key(path: &[&[u8]], user_key: &[u8]) -> Vec<u8> {
+    let mut key = encode_path(NESTED_BUCKET_DATA_PREFIX, path);
+    key.extend_from_slice(user_key);
+    key
+}
+
+/// Returns the prefix for all data keys in a nested bucket.
+///
+/// Used for iteration and range queries.
+#[inline]
+pub fn nested_bucket_data_prefix(path: &[&[u8]]) -> Vec<u8> {
+    encode_path(NESTED_BUCKET_DATA_PREFIX, path)
+}
+
+/// Validates a nested bucket path.
+///
+/// # Errors
+///
+/// Returns `InvalidBucketName` if any component is empty, exceeds max length,
+/// or if the path exceeds maximum nesting depth.
+pub fn validate_nested_bucket_path(path: &[&[u8]]) -> Result<()> {
+    if path.is_empty() {
+        return Err(Error::InvalidBucketName {
+            reason: "nested bucket path cannot be empty",
+        });
+    }
+    if path.len() > MAX_NESTING_DEPTH {
+        return Err(Error::InvalidBucketName {
+            reason: "nested bucket path exceeds maximum nesting depth",
+        });
+    }
+    for component in path {
+        validate_bucket_name(component)?;
+    }
+    Ok(())
+}
+
+/// Checks if a nested bucket exists in the tree.
+///
+/// The path must include at least the parent bucket and the nested bucket name.
+/// For example: `&[b"parent", b"child"]` checks if "child" exists under "parent".
+pub fn nested_bucket_exists(tree: &BTree, path: &[&[u8]]) -> bool {
+    if path.len() < 2 {
+        return false;
+    }
+    let meta_key = nested_bucket_meta_key(path);
+    tree.get(&meta_key).is_some()
+}
+
+/// Creates a nested bucket in the tree.
+///
+/// The path must include the parent bucket(s) and the new bucket name.
+/// For example: `&[b"parent", b"child"]` creates "child" under "parent".
+///
+/// # Errors
+///
+/// Returns `BucketNotFound` if the parent bucket doesn't exist.
+/// Returns `BucketAlreadyExists` if a nested bucket with the same path already exists.
+/// Returns `InvalidBucketName` if any path component is invalid.
+pub fn create_nested_bucket(tree: &mut BTree, path: &[&[u8]]) -> Result<()> {
+    validate_nested_bucket_path(path)?;
+
+    // Ensure parent exists (either top-level bucket or nested bucket).
+    if path.len() == 2 {
+        // Parent is a top-level bucket.
+        if !bucket_exists(tree, path[0]) {
+            return Err(Error::BucketNotFound {
+                name: path[0].to_vec(),
+            });
+        }
+    } else {
+        // Parent is a nested bucket.
+        let parent_path = &path[..path.len() - 1];
+        if !nested_bucket_exists(tree, parent_path) {
+            return Err(Error::BucketNotFound {
+                name: parent_path.iter().map(|p| p.to_vec()).collect::<Vec<_>>().concat(),
+            });
+        }
+    }
+
+    // Check if this nested bucket already exists.
+    let meta_key = nested_bucket_meta_key(path);
+    if tree.get(&meta_key).is_some() {
+        return Err(Error::BucketAlreadyExists {
+            name: path.last().unwrap().to_vec(),
+        });
+    }
+
+    // Store nested bucket metadata.
+    tree.insert(meta_key, Vec::new());
+    Ok(())
+}
+
+/// Creates a nested bucket if it doesn't exist.
+///
+/// Returns `true` if a new bucket was created, `false` if it already existed.
+///
+/// # Errors
+///
+/// Returns `BucketNotFound` if the parent bucket doesn't exist.
+/// Returns `InvalidBucketName` if any path component is invalid.
+pub fn create_nested_bucket_if_not_exists(tree: &mut BTree, path: &[&[u8]]) -> Result<bool> {
+    validate_nested_bucket_path(path)?;
+
+    // Ensure parent exists.
+    if path.len() == 2 {
+        if !bucket_exists(tree, path[0]) {
+            return Err(Error::BucketNotFound {
+                name: path[0].to_vec(),
+            });
+        }
+    } else {
+        let parent_path = &path[..path.len() - 1];
+        if !nested_bucket_exists(tree, parent_path) {
+            return Err(Error::BucketNotFound {
+                name: parent_path.iter().map(|p| p.to_vec()).collect::<Vec<_>>().concat(),
+            });
+        }
+    }
+
+    let meta_key = nested_bucket_meta_key(path);
+    if tree.get(&meta_key).is_some() {
+        return Ok(false);
+    }
+
+    tree.insert(meta_key, Vec::new());
+    Ok(true)
+}
+
+/// Deletes a nested bucket and all its contents from the tree.
+///
+/// This also recursively deletes any nested buckets within the deleted bucket.
+///
+/// # Errors
+///
+/// Returns `BucketNotFound` if the nested bucket doesn't exist.
+/// Returns `InvalidBucketName` if any path component is invalid.
+pub fn delete_nested_bucket(tree: &mut BTree, path: &[&[u8]]) -> Result<()> {
+    validate_nested_bucket_path(path)?;
+
+    let meta_key = nested_bucket_meta_key(path);
+    if tree.get(&meta_key).is_none() {
+        return Err(Error::BucketNotFound {
+            name: path.last().unwrap().to_vec(),
+        });
+    }
+
+    // Collect all keys to delete:
+    // 1. All data entries in this bucket
+    // 2. All nested bucket metadata under this bucket
+    // 3. All data entries in nested buckets under this bucket
+    let data_prefix = nested_bucket_data_prefix(path);
+    let meta_prefix = encode_path(NESTED_BUCKET_META_PREFIX, path);
+
+    let keys_to_delete: Vec<Vec<u8>> = tree
+        .iter()
+        .filter_map(|(k, _)| {
+            // Match data entries for this bucket and children.
+            if k.starts_with(&data_prefix) {
+                return Some(k.to_vec());
+            }
+            // Match nested bucket metadata for children.
+            // We need to check if this key represents a child nested bucket.
+            if k.first() == Some(&NESTED_BUCKET_META_PREFIX) && k.starts_with(&meta_prefix) && k.len() > meta_prefix.len() {
+                return Some(k.to_vec());
+            }
+            // Also match child data under NESTED_BUCKET_DATA_PREFIX with longer paths.
+            if k.first() == Some(&NESTED_BUCKET_DATA_PREFIX) {
+                // Check if this is a child path by verifying path prefix matches.
+                let path_encoded_prefix = &encode_path(NESTED_BUCKET_DATA_PREFIX, path)[..];
+                if k.len() > path_encoded_prefix.len() {
+                    // Need to check if the path is actually a child, not just starts with same bytes.
+                    // Decode and compare the path components.
+                    if is_child_path(k, path) {
+                        return Some(k.to_vec());
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Delete all collected keys.
+    for key in keys_to_delete {
+        tree.remove(&key);
+    }
+
+    // Delete the nested bucket metadata itself.
+    tree.remove(&meta_key);
+
+    Ok(())
+}
+
+/// Helper function to check if a key represents a child of the given path.
+fn is_child_path(key: &[u8], parent_path: &[&[u8]]) -> bool {
+    if key.len() < 2 {
+        return false;
+    }
+
+    let component_count = key[1] as usize;
+    if component_count <= parent_path.len() {
+        return false;
+    }
+
+    // Decode and compare path components.
+    let mut offset = 2;
+    for (i, parent_component) in parent_path.iter().enumerate() {
+        if offset >= key.len() {
+            return false;
+        }
+        let len = key[offset] as usize;
+        offset += 1;
+        if offset + len > key.len() {
+            return false;
+        }
+        if i < parent_path.len() && &key[offset..offset + len] != *parent_component {
+            return false;
+        }
+        offset += len;
+    }
+
+    true
+}
+
+/// Lists all nested bucket names directly under a parent bucket.
+///
+/// For a top-level bucket, pass the bucket name.
+/// For a nested bucket, pass the full path.
+pub fn list_nested_buckets(tree: &BTree, parent_path: &[&[u8]]) -> Vec<Vec<u8>> {
+    let expected_depth = parent_path.len() + 1;
+
+    tree.iter()
+        .filter_map(|(k, _)| {
+            if k.first() != Some(&NESTED_BUCKET_META_PREFIX) {
+                return None;
+            }
+            if k.len() < 2 {
+                return None;
+            }
+
+            let component_count = k[1] as usize;
+            if component_count != expected_depth {
+                return None;
+            }
+
+            // Decode path and verify parent matches.
+            let mut offset = 2;
+            for parent_component in parent_path {
+                if offset >= k.len() {
+                    return None;
+                }
+                let len = k[offset] as usize;
+                offset += 1;
+                if offset + len > k.len() {
+                    return None;
+                }
+                if &k[offset..offset + len] != *parent_component {
+                    return None;
+                }
+                offset += len;
+            }
+
+            // Extract the child bucket name.
+            if offset >= k.len() {
+                return None;
+            }
+            let child_len = k[offset] as usize;
+            offset += 1;
+            if offset + child_len > k.len() {
+                return None;
+            }
+            Some(k[offset..offset + child_len].to_vec())
+        })
+        .collect()
+}
+
+/// A read-only view of a nested bucket.
+///
+/// Provides read access to key-value pairs within the nested bucket's namespace.
+#[derive(Debug)]
+pub struct NestedBucketRef<'a> {
+    tree: &'a BTree,
+    path: Vec<Vec<u8>>,
+}
+
+impl<'a> NestedBucketRef<'a> {
+    /// Creates a new nested bucket reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BucketNotFound` if the nested bucket doesn't exist.
+    pub fn new(tree: &'a BTree, path: &[&[u8]]) -> Result<Self> {
+        validate_nested_bucket_path(path)?;
+
+        if !nested_bucket_exists(tree, path) {
+            return Err(Error::BucketNotFound {
+                name: path.last().unwrap().to_vec(),
+            });
+        }
+
+        Ok(Self {
+            tree,
+            path: path.iter().map(|p| p.to_vec()).collect(),
+        })
+    }
+
+    /// Returns the bucket path.
+    #[inline]
+    pub fn path(&self) -> Vec<&[u8]> {
+        self.path.iter().map(|p| p.as_slice()).collect()
+    }
+
+    /// Retrieves the value associated with the given key.
+    ///
+    /// Returns `None` if the key does not exist in this nested bucket.
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        let path_refs: Vec<&[u8]> = self.path.iter().map(|p| p.as_slice()).collect();
+        let internal_key = nested_bucket_data_key(&path_refs, key);
+        self.tree.get(&internal_key)
+    }
+
+    /// Returns an iterator over all key-value pairs in the nested bucket.
+    ///
+    /// Keys are returned without the bucket prefix.
+    pub fn iter(&self) -> NestedBucketIter<'_> {
+        NestedBucketIter::new(self.tree, &self.path)
+    }
+}
+
+/// Iterator over key-value pairs in a nested bucket.
+pub struct NestedBucketIter<'a> {
+    inner: crate::btree::BTreeIter<'a>,
+    prefix: Vec<u8>,
+    prefix_len: usize,
+}
+
+impl<'a> NestedBucketIter<'a> {
+    fn new(tree: &'a BTree, path: &[Vec<u8>]) -> Self {
+        let path_refs: Vec<&[u8]> = path.iter().map(|p| p.as_slice()).collect();
+        let prefix = nested_bucket_data_prefix(&path_refs);
+        let prefix_len = prefix.len();
+        Self {
+            inner: tree.iter(),
+            prefix,
+            prefix_len,
+        }
+    }
+}
+
+impl<'a> Iterator for NestedBucketIter<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (key, value) = self.inner.next()?;
+
+            // Skip keys before our prefix.
+            if key < self.prefix.as_slice() {
+                continue;
+            }
+
+            // Stop when we've passed our prefix range.
+            if !key.starts_with(&self.prefix) {
+                return None;
+            }
+
+            // Return the user key (without prefix).
+            let user_key = &key[self.prefix_len..];
+            return Some((user_key, value));
+        }
+    }
 }
 
 /// A read-only view of a bucket.
@@ -557,5 +984,170 @@ mod tests {
 
         assert_eq!(b1.iter().count(), 1);
         assert_eq!(b2.iter().count(), 1);
+    }
+
+    // ==================== Nested Bucket Tests ====================
+
+    #[test]
+    fn test_nested_bucket_key_format() {
+        let path: [&[u8]; 2] = [b"parent", b"child"];
+        let meta_key = nested_bucket_meta_key(&path);
+
+        assert_eq!(meta_key[0], 0x02); // NESTED_BUCKET_META_PREFIX
+        assert_eq!(meta_key[1], 2); // 2 path components
+        assert_eq!(meta_key[2], 6); // "parent" length
+        assert_eq!(&meta_key[3..9], b"parent");
+        assert_eq!(meta_key[9], 5); // "child" length
+        assert_eq!(&meta_key[10..], b"child");
+
+        let data_key = nested_bucket_data_key(&path, b"mykey");
+        assert_eq!(data_key[0], 0x03); // NESTED_BUCKET_DATA_PREFIX
+        assert_eq!(data_key[1], 2); // 2 path components
+        assert_eq!(&data_key[data_key.len() - 5..], b"mykey");
+    }
+
+    #[test]
+    fn test_nested_bucket_create_delete() {
+        let mut tree = BTree::new();
+        create_bucket(&mut tree, b"parent").unwrap();
+
+        let path: [&[u8]; 2] = [b"parent", b"child"];
+
+        // Create nested bucket.
+        assert!(create_nested_bucket(&mut tree, &path).is_ok());
+        assert!(nested_bucket_exists(&tree, &path));
+
+        // Duplicate should fail.
+        assert!(matches!(
+            create_nested_bucket(&mut tree, &path).unwrap_err(),
+            Error::BucketAlreadyExists { .. }
+        ));
+
+        // Delete nested bucket.
+        assert!(delete_nested_bucket(&mut tree, &path).is_ok());
+        assert!(!nested_bucket_exists(&tree, &path));
+
+        // Delete non-existent should fail.
+        assert!(matches!(
+            delete_nested_bucket(&mut tree, &path).unwrap_err(),
+            Error::BucketNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn test_nested_bucket_requires_parent() {
+        let mut tree = BTree::new();
+
+        let path: [&[u8]; 2] = [b"nonexistent", b"child"];
+        assert!(matches!(
+            create_nested_bucket(&mut tree, &path).unwrap_err(),
+            Error::BucketNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn test_nested_bucket_ref_operations() {
+        let mut tree = BTree::new();
+        create_bucket(&mut tree, b"parent").unwrap();
+
+        let path: [&[u8]; 2] = [b"parent", b"child"];
+        create_nested_bucket(&mut tree, &path).unwrap();
+
+        let key = nested_bucket_data_key(&path, b"key");
+        tree.insert(key, b"value".to_vec());
+
+        let bucket = NestedBucketRef::new(&tree, &path).unwrap();
+        assert_eq!(bucket.get(b"key"), Some(&b"value"[..]));
+        assert_eq!(bucket.get(b"missing"), None);
+
+        let items: Vec<_> = bucket.iter().collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0], (&b"key"[..], &b"value"[..]));
+    }
+
+    #[test]
+    fn test_nested_bucket_isolation() {
+        let mut tree = BTree::new();
+        create_bucket(&mut tree, b"parent").unwrap();
+
+        let path1: [&[u8]; 2] = [b"parent", b"child1"];
+        let path2: [&[u8]; 2] = [b"parent", b"child2"];
+
+        create_nested_bucket(&mut tree, &path1).unwrap();
+        create_nested_bucket(&mut tree, &path2).unwrap();
+
+        tree.insert(nested_bucket_data_key(&path1, b"key"), b"value1".to_vec());
+        tree.insert(nested_bucket_data_key(&path2, b"key"), b"value2".to_vec());
+
+        let b1 = NestedBucketRef::new(&tree, &path1).unwrap();
+        let b2 = NestedBucketRef::new(&tree, &path2).unwrap();
+
+        assert_eq!(b1.get(b"key"), Some(&b"value1"[..]));
+        assert_eq!(b2.get(b"key"), Some(&b"value2"[..]));
+
+        assert_eq!(b1.iter().count(), 1);
+        assert_eq!(b2.iter().count(), 1);
+    }
+
+    #[test]
+    fn test_list_nested_buckets() {
+        let mut tree = BTree::new();
+        create_bucket(&mut tree, b"parent").unwrap();
+
+        let path1: [&[u8]; 2] = [b"parent", b"alpha"];
+        let path2: [&[u8]; 2] = [b"parent", b"beta"];
+        let path3: [&[u8]; 2] = [b"parent", b"gamma"];
+
+        create_nested_bucket(&mut tree, &path1).unwrap();
+        create_nested_bucket(&mut tree, &path2).unwrap();
+        create_nested_bucket(&mut tree, &path3).unwrap();
+
+        let children = list_nested_buckets(&tree, &[b"parent"]);
+        assert_eq!(children.len(), 3);
+        assert!(children.contains(&b"alpha".to_vec()));
+        assert!(children.contains(&b"beta".to_vec()));
+        assert!(children.contains(&b"gamma".to_vec()));
+    }
+
+    #[test]
+    fn test_deep_nested_bucket() {
+        let mut tree = BTree::new();
+        create_bucket(&mut tree, b"root").unwrap();
+
+        // Create root -> level1
+        let path1: [&[u8]; 2] = [b"root", b"level1"];
+        create_nested_bucket(&mut tree, &path1).unwrap();
+
+        // Create root -> level1 -> level2
+        let path2: [&[u8]; 3] = [b"root", b"level1", b"level2"];
+        create_nested_bucket(&mut tree, &path2).unwrap();
+
+        assert!(nested_bucket_exists(&tree, &path1));
+        assert!(nested_bucket_exists(&tree, &path2));
+
+        // Add data at level2.
+        let key = nested_bucket_data_key(&path2, b"deep_key");
+        tree.insert(key, b"deep_value".to_vec());
+
+        let bucket = NestedBucketRef::new(&tree, &path2).unwrap();
+        assert_eq!(bucket.get(b"deep_key"), Some(&b"deep_value"[..]));
+    }
+
+    #[test]
+    fn test_validate_nested_bucket_path() {
+        // Empty path.
+        assert!(validate_nested_bucket_path(&[]).is_err());
+
+        // Single component (must have at least parent + child).
+        let single: [&[u8]; 1] = [b"only"];
+        assert!(validate_nested_bucket_path(&single).is_ok());
+
+        // Empty component.
+        let empty: [&[u8]; 2] = [b"parent", b""];
+        assert!(validate_nested_bucket_path(&empty).is_err());
+
+        // Valid path.
+        let valid: [&[u8]; 3] = [b"a", b"b", b"c"];
+        assert!(validate_nested_bucket_path(&valid).is_ok());
     }
 }
