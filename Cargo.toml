@@ -13,6 +13,7 @@ no_checksum = []
 libc = "0.2.178"
 crc32fast = "1.5"
 nix = { version = "0.29", features = ["fs", "uio"] }
+rayon = "1.11"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }

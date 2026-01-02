@@ -11,9 +11,12 @@ use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
+use rayon::prelude::*;
+
 use crate::bloom::BloomFilter;
 use crate::btree::BTree;
 use crate::checkpoint::{CheckpointConfig, CheckpointInfo, CheckpointManager};
+use crate::concurrent::PARALLEL_THRESHOLD;
 use crate::error::{Error, Result};
 use crate::meta::Meta;
 use crate::mmap::Mmap;
@@ -412,6 +415,7 @@ impl Database {
     /// Forces a refresh of the memory mapping with the new file length.
     /// Call this when the file has grown and you need to read the new data.
     #[cfg(unix)]
+    #[allow(dead_code)]
     fn refresh_mmap_to_size(&mut self, new_len: usize) -> Result<()> {
         let current_mmap_len = self.mmap.as_ref().map(|m| m.len()).unwrap_or(0);
         if new_len > current_mmap_len && new_len > 2 * PAGE_SIZE {
@@ -1056,6 +1060,9 @@ impl Database {
     /// This is much faster than `persist_tree` for workloads with many small commits
     /// because it only appends new entries rather than rewriting all data.
     ///
+    /// For large batches (>100 entries), uses parallel processing to prepare
+    /// serialized data, significantly improving throughput on multi-core systems.
+    ///
     /// # Arguments
     ///
     /// * `new_entries` - Iterator of (key, value) pairs to append.
@@ -1086,6 +1093,12 @@ impl Database {
         let overflow_threshold = self.options.overflow_threshold;
         let page_size = self.page_size;
 
+        // Use parallel processing for large batches
+        if entries.len() >= PARALLEL_THRESHOLD {
+            return self.persist_incremental_parallel(&entries, total_entry_count);
+        }
+
+        // Sequential path for smaller batches (avoids thread pool overhead)
         // First pass: calculate total sizes needed for single-allocation optimization.
         // Use direct write format for large values: [len:4][data:N][crc:4] = N+8 bytes
         let mut total_overflow_size: usize = 0;
@@ -1266,15 +1279,15 @@ impl Database {
             }
 
             // Write overflow data using pwrite at the calculated byte offset
-            if has_overflow_data {
-                if let Err(e) = self.file.write_at(&all_overflow_data, overflow_start) {
-                    return Err(Error::FileWrite {
-                        offset: overflow_start,
-                        len: all_overflow_data.len(),
-                        context: "writing overflow data (incremental, pwrite)",
-                        source: e,
-                    });
-                }
+            if has_overflow_data
+                && let Err(e) = self.file.write_at(&all_overflow_data, overflow_start)
+            {
+                return Err(Error::FileWrite {
+                    offset: overflow_start,
+                    len: all_overflow_data.len(),
+                    context: "writing overflow data (incremental, pwrite)",
+                    source: e,
+                });
             }
         }
 
@@ -1356,6 +1369,273 @@ impl Database {
         Self::fdatasync(&self.file)?;
 
         // Refresh mmap to reflect new file size.
+        #[cfg(unix)]
+        self.refresh_mmap()?;
+
+        Ok(())
+    }
+
+    /// Parallel version of persist_incremental for large batches.
+    ///
+    /// Uses rayon to parallelize entry serialization across multiple cores.
+    /// This significantly improves throughput for batches with hundreds or
+    /// thousands of entries.
+    fn persist_incremental_parallel(
+        &mut self,
+        entries: &[(&[u8], &[u8])],
+        total_entry_count: u64,
+    ) -> Result<()> {
+        let overflow_threshold = self.options.overflow_threshold;
+        let page_size = self.page_size;
+
+        // Phase 1: Parallel size calculation and entry preparation
+        // Each entry is processed independently to compute its serialized form
+        #[derive(Clone)]
+        struct PreparedEntry {
+            key_data: Vec<u8>,
+            value_data: Vec<u8>,
+            key: Vec<u8>,
+            is_overflow: bool,
+            overflow_value: Option<Vec<u8>>,
+        }
+
+        let prepared: Vec<PreparedEntry> = entries
+            .par_iter()
+            .map(|(key, value)| {
+                // Serialize key: [len:4][key_bytes]
+                let mut key_data = Vec::with_capacity(4 + key.len());
+                key_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                key_data.extend_from_slice(key);
+
+                let is_overflow = value.len() > overflow_threshold;
+                let value_data = if is_overflow {
+                    // Placeholder for overflow marker + ref
+                    let mut data = Vec::with_capacity(16);
+                    data.extend_from_slice(&OverflowRef::MARKER.to_le_bytes());
+                    data.extend_from_slice(&[0u8; 12]); // Placeholder
+                    data
+                } else {
+                    // Inline: [len:4][value_bytes]
+                    let mut data = Vec::with_capacity(4 + value.len());
+                    data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    data.extend_from_slice(value);
+                    data
+                };
+
+                PreparedEntry {
+                    key_data,
+                    value_data,
+                    key: key.to_vec(),
+                    is_overflow,
+                    overflow_value: if is_overflow {
+                        Some(value.to_vec())
+                    } else {
+                        None
+                    },
+                }
+            })
+            .collect();
+
+        // Phase 2: Calculate total sizes (sequential but fast - just summing)
+        let entry_buf_size: usize = prepared
+            .iter()
+            .map(|e| e.key_data.len() + e.value_data.len())
+            .sum();
+
+        let total_overflow_size: usize = prepared
+            .iter()
+            .filter(|e| e.is_overflow)
+            .map(|e| {
+                OverflowManager::direct_buffer_size(e.overflow_value.as_ref().unwrap().len())
+            })
+            .sum();
+
+        // Pre-allocate buffers
+        let mut entry_buf = vec![0u8; entry_buf_size];
+        let mut all_overflow_data = vec![0u8; total_overflow_size];
+
+        // Calculate overflow position
+        let new_data_end = self.data_end_offset + entry_buf_size as u64;
+        let overflow_start = new_data_end.div_ceil(page_size as u64) * page_size as u64;
+        let overflow_start_page = overflow_start / page_size as u64;
+
+        // Update overflow manager
+        self.overflow_manager.set_next_page_id(overflow_start_page);
+
+        // Phase 3: Sequential assembly (must be sequential for overflow refs)
+        let mut entry_offset: usize = 0;
+        let mut overflow_offset: usize = 0;
+        let mut has_overflow_data = false;
+
+        for entry in &prepared {
+            // Copy key data
+            entry_buf[entry_offset..entry_offset + entry.key_data.len()]
+                .copy_from_slice(&entry.key_data);
+            entry_offset += entry.key_data.len();
+
+            if entry.is_overflow {
+                // Write overflow marker
+                entry_buf[entry_offset..entry_offset + 4]
+                    .copy_from_slice(&OverflowRef::MARKER.to_le_bytes());
+                entry_offset += 4;
+
+                // Write overflow data and get ref
+                let value = entry.overflow_value.as_ref().unwrap();
+                let (oref, bytes_written) = self.overflow_manager.write_direct_to_buffer(
+                    value,
+                    &mut all_overflow_data,
+                    overflow_offset,
+                    overflow_start,
+                );
+
+                if bytes_written > 0 {
+                    has_overflow_data = true;
+                }
+                overflow_offset += bytes_written;
+
+                // Write overflow ref
+                entry_buf[entry_offset..entry_offset + 12].copy_from_slice(&oref.to_bytes());
+                entry_offset += 12;
+
+                self.overflow_refs.insert(entry.key.clone(), oref);
+            } else {
+                // Copy inline value data
+                entry_buf[entry_offset..entry_offset + entry.value_data.len()]
+                    .copy_from_slice(&entry.value_data);
+                entry_offset += entry.value_data.len();
+            }
+        }
+
+        // Phase 4: Write to disk (same as sequential version)
+        self.data_end_offset = new_data_end;
+        self.persisted_entry_count = total_entry_count;
+
+        self.meta.txid += 1;
+        self.meta.root = 1;
+
+        let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
+        let meta_offset = meta_page * PAGE_SIZE as u64;
+
+        #[cfg(unix)]
+        {
+            let meta_bytes = self.meta.to_bytes();
+
+            if let Err(e) = self.file.write_at(&meta_bytes, meta_offset) {
+                return Err(Error::FileWrite {
+                    offset: meta_offset,
+                    len: PAGE_SIZE,
+                    context: "writing meta page (parallel incremental, pwrite)",
+                    source: e,
+                });
+            }
+
+            let data_offset = 2 * PAGE_SIZE as u64;
+            if let Err(e) = self.file.write_at(&total_entry_count.to_le_bytes(), data_offset) {
+                return Err(Error::FileWrite {
+                    offset: data_offset,
+                    len: 8,
+                    context: "writing entry count (parallel, pwrite)",
+                    source: e,
+                });
+            }
+
+            let entry_write_offset = self.data_end_offset - entry_buf.len() as u64;
+            if let Err(e) = self.file.write_at(&entry_buf, entry_write_offset) {
+                return Err(Error::FileWrite {
+                    offset: entry_write_offset,
+                    len: entry_buf.len(),
+                    context: "writing entry data (parallel incremental, pwrite)",
+                    source: e,
+                });
+            }
+
+            if has_overflow_data
+                && let Err(e) = self.file.write_at(&all_overflow_data, overflow_start)
+            {
+                return Err(Error::FileWrite {
+                    offset: overflow_start,
+                    len: all_overflow_data.len(),
+                    context: "writing overflow data (parallel incremental, pwrite)",
+                    source: e,
+                });
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let meta_bytes = self.meta.to_bytes();
+
+            if let Err(e) = self.file.seek(SeekFrom::Start(meta_offset)) {
+                return Err(Error::FileSeek {
+                    offset: meta_offset,
+                    context: "seeking to meta page (parallel incremental)",
+                    source: e,
+                });
+            }
+            if let Err(e) = self.file.write_all(&meta_bytes) {
+                return Err(Error::FileWrite {
+                    offset: meta_offset,
+                    len: PAGE_SIZE,
+                    context: "writing meta page (parallel incremental)",
+                    source: e,
+                });
+            }
+
+            let data_offset = 2 * PAGE_SIZE as u64;
+            if let Err(e) = self.file.seek(SeekFrom::Start(data_offset)) {
+                return Err(Error::FileSeek {
+                    offset: data_offset,
+                    context: "seeking to entry count (parallel)",
+                    source: e,
+                });
+            }
+            if let Err(e) = self.file.write_all(&total_entry_count.to_le_bytes()) {
+                return Err(Error::FileWrite {
+                    offset: data_offset,
+                    len: 8,
+                    context: "writing entry count (parallel)",
+                    source: e,
+                });
+            }
+
+            let entry_write_offset = self.data_end_offset - entry_buf.len() as u64;
+            if let Err(e) = self.file.seek(SeekFrom::Start(entry_write_offset)) {
+                return Err(Error::FileSeek {
+                    offset: entry_write_offset,
+                    context: "seeking to entry data (parallel)",
+                    source: e,
+                });
+            }
+            if let Err(e) = self.file.write_all(&entry_buf) {
+                return Err(Error::FileWrite {
+                    offset: entry_write_offset,
+                    len: entry_buf.len(),
+                    context: "writing entry data (parallel incremental)",
+                    source: e,
+                });
+            }
+
+            if has_overflow_data {
+                if let Err(e) = self.file.seek(SeekFrom::Start(overflow_start)) {
+                    return Err(Error::FileSeek {
+                        offset: overflow_start,
+                        context: "seeking to overflow data (parallel)",
+                        source: e,
+                    });
+                }
+                if let Err(e) = self.file.write_all(&all_overflow_data) {
+                    return Err(Error::FileWrite {
+                        offset: overflow_start,
+                        len: all_overflow_data.len(),
+                        context: "writing overflow data (parallel incremental)",
+                        source: e,
+                    });
+                }
+            }
+        }
+
+        Self::fdatasync(&self.file)?;
+
         #[cfg(unix)]
         self.refresh_mmap()?;
 
