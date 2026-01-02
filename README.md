@@ -27,14 +27,15 @@ Thunder achieves excellent performance, outperforming BBolt across most workload
 
 | Benchmark | Thunder | BBolt | Result |
 |-----------|---------|-------|--------|
-| Sequential writes | 740K ops/sec | 395K ops/sec | **Thunder 1.9× faster** |
-| Sequential reads | 2.6M ops/sec | 1.6M ops/sec | **Thunder 1.7× faster** |
-| Random reads | 1.1M ops/sec | 697K ops/sec | **Thunder 1.6× faster** |
-| Iterator scan | 78M ops/sec | 63M ops/sec | **Thunder 1.2× faster** |
-| Mixed workload | 6,120 ops/sec | 5,462 ops/sec | **Thunder 1.1× faster** |
-| Transaction throughput | 1,590 tx/sec | 1,300 tx/sec | **Thunder 1.2× faster** |
+| Sequential writes | 617K ops/sec | 315K ops/sec | **Thunder 2.0× faster** |
+| Sequential reads | 2.4M ops/sec | 1.5M ops/sec | **Thunder 1.6× faster** |
+| Iterator scan | 78.6M ops/sec | 27.1M ops/sec | **Thunder 2.9× faster** |
+| Mixed workload | 6,034 ops/sec | 5,086 ops/sec | **Thunder 1.2× faster** |
+| Transaction throughput | 1,396 tx/sec | 1,214 tx/sec | **Thunder 1.2× faster** |
+| Large values (10KB) | 437 MB/sec | 115 MB/sec | **Thunder 3.8× faster** |
+| Large values (100KB) | 534 MB/sec | 244 MB/sec | **Thunder 2.2× faster** |
 
-See [bench.md](bench.md) for full benchmark details including YCSB workloads and large value performance.
+See [bench.md](bench.md) for full benchmark details and methodology.
 
 ## Quick Start
 
@@ -152,7 +153,7 @@ For production use cases requiring stability and robustness, please use establis
 
 ## Architecture
 
-Thunder is implemented in ~3,000 lines of Rust:
+Thunder is implemented in ~3,500 lines of Rust:
 
 ```
 src/
@@ -198,14 +199,12 @@ cargo test
 ## Running Benchmarks
 
 ```bash
-# Run Thunder benchmark suite
-cargo run --release --bin thunder_bench
-```
+# Run Thunder benchmark
+cargo build --release --example thunder_bench
+./target/release/examples/thunder_bench
 
-## License
-
-MIT
-
+# Run BBolt benchmark for comparison
+cd bench && go run bbolt_bench.go
 ```
 
 ## License
