@@ -87,7 +87,7 @@ impl IVec {
     }
 
     /// Creates an IVec from a Vec, consuming it.
-    /// 
+    ///
     /// For large values, this avoids a copy by using Arc::from.
     #[inline]
     pub fn from_vec(data: Vec<u8>) -> Self {
@@ -132,7 +132,7 @@ impl IVec {
     }
 
     /// Converts to a Vec<u8>.
-    /// 
+    ///
     /// For inline values, this allocates. For heap values, if the Arc
     /// has only one reference, it unwraps without copying.
     #[inline]

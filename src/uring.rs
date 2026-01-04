@@ -8,7 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::io_backend::{IoBackend, ReadOp, ReadResult, WriteOp};
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 

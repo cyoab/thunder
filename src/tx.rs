@@ -3,8 +3,8 @@
 
 use std::ops::RangeBounds;
 
-use crate::btree::{Bound, BTree, BTreeIter, BTreeRangeIter};
-use crate::bucket::{self, bucket_exists, list_buckets, BucketRef, NestedBucketRef};
+use crate::btree::{BTree, BTreeIter, BTreeRangeIter, Bound};
+use crate::bucket::{self, BucketRef, NestedBucketRef, bucket_exists, list_buckets};
 use crate::db::Database;
 use crate::error::{Error, Result};
 
@@ -493,7 +493,11 @@ impl<'db> WriteTx<'db> {
         let meta_key = bucket::bucket_meta_key(name);
 
         // Check if marked for deletion.
-        if self.deleted.iter().any(|k| k.as_slice() == meta_key.as_slice()) {
+        if self
+            .deleted
+            .iter()
+            .any(|k| k.as_slice() == meta_key.as_slice())
+        {
             return false;
         }
 
@@ -541,7 +545,8 @@ impl<'db> WriteTx<'db> {
         let internal_key = bucket::bucket_data_key(bucket_name, key);
 
         // Remove from deleted list if present.
-        self.deleted.retain(|k| k.as_slice() != internal_key.as_slice());
+        self.deleted
+            .retain(|k| k.as_slice() != internal_key.as_slice());
 
         // Add to pending.
         self.pending.insert(internal_key, value.to_vec());
@@ -573,7 +578,11 @@ impl<'db> WriteTx<'db> {
         }
 
         // Check if deleted.
-        if self.deleted.iter().any(|k| k.as_slice() == internal_key.as_slice()) {
+        if self
+            .deleted
+            .iter()
+            .any(|k| k.as_slice() == internal_key.as_slice())
+        {
             return Ok(None);
         }
 
@@ -601,7 +610,11 @@ impl<'db> WriteTx<'db> {
         self.pending.remove(&internal_key);
 
         // Mark for deletion from main tree.
-        if !self.deleted.iter().any(|k| k.as_slice() == internal_key.as_slice()) {
+        if !self
+            .deleted
+            .iter()
+            .any(|k| k.as_slice() == internal_key.as_slice())
+        {
             self.deleted.push(internal_key);
         }
 
@@ -637,7 +650,10 @@ impl<'db> WriteTx<'db> {
         // Remove buckets that are marked for deletion.
         buckets.retain(|name| {
             let meta_key = bucket::bucket_meta_key(name);
-            !self.deleted.iter().any(|k| k.as_slice() == meta_key.as_slice())
+            !self
+                .deleted
+                .iter()
+                .any(|k| k.as_slice() == meta_key.as_slice())
         });
 
         buckets
@@ -693,7 +709,11 @@ impl<'db> WriteTx<'db> {
     /// Returns `BucketNotFound` if the parent bucket doesn't exist.
     /// Returns `BucketAlreadyExists` if the nested bucket already exists.
     /// Returns `InvalidBucketName` if any name is invalid.
-    pub fn create_nested_bucket_at_path(&mut self, parent_path: &[&[u8]], child: &[u8]) -> Result<()> {
+    pub fn create_nested_bucket_at_path(
+        &mut self,
+        parent_path: &[&[u8]],
+        child: &[u8],
+    ) -> Result<()> {
         bucket::validate_bucket_name(child)?;
         for component in parent_path {
             bucket::validate_bucket_name(component)?;
@@ -732,7 +752,11 @@ impl<'db> WriteTx<'db> {
     /// Creates a nested bucket if it doesn't exist.
     ///
     /// Returns `true` if a new bucket was created, `false` if it already existed.
-    pub fn create_nested_bucket_if_not_exists(&mut self, parent: &[u8], child: &[u8]) -> Result<bool> {
+    pub fn create_nested_bucket_if_not_exists(
+        &mut self,
+        parent: &[u8],
+        child: &[u8],
+    ) -> Result<bool> {
         bucket::validate_bucket_name(parent)?;
         bucket::validate_bucket_name(child)?;
 
@@ -778,7 +802,11 @@ impl<'db> WriteTx<'db> {
     ///
     /// Returns `BucketNotFound` if the nested bucket doesn't exist.
     /// Returns `InvalidBucketName` if any name is invalid.
-    pub fn delete_nested_bucket_at_path(&mut self, parent_path: &[&[u8]], child: &[u8]) -> Result<()> {
+    pub fn delete_nested_bucket_at_path(
+        &mut self,
+        parent_path: &[&[u8]],
+        child: &[u8],
+    ) -> Result<()> {
         bucket::validate_bucket_name(child)?;
         for component in parent_path {
             bucket::validate_bucket_name(component)?;
@@ -925,13 +953,16 @@ impl<'db> WriteTx<'db> {
         let meta_key = bucket::nested_bucket_meta_key(path);
 
         // Check if marked for deletion.
-        if self.deleted.iter().any(|k| k.as_slice() == meta_key.as_slice()) {
+        if self
+            .deleted
+            .iter()
+            .any(|k| k.as_slice() == meta_key.as_slice())
+        {
             return false;
         }
 
         // Check pending and main tree.
-        self.pending.get(&meta_key).is_some()
-            || bucket::nested_bucket_exists(self.db.tree(), path)
+        self.pending.get(&meta_key).is_some() || bucket::nested_bucket_exists(self.db.tree(), path)
     }
 
     /// Puts a key-value pair into a nested bucket.
@@ -940,7 +971,13 @@ impl<'db> WriteTx<'db> {
     ///
     /// Returns `BucketNotFound` if the nested bucket doesn't exist.
     /// Returns `InvalidBucketName` if any name is invalid.
-    pub fn nested_bucket_put(&mut self, parent: &[u8], child: &[u8], key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn nested_bucket_put(
+        &mut self,
+        parent: &[u8],
+        child: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
         bucket::validate_bucket_name(parent)?;
         bucket::validate_bucket_name(child)?;
 
@@ -952,7 +989,8 @@ impl<'db> WriteTx<'db> {
         }
 
         let internal_key = bucket::nested_bucket_data_key(&path, key);
-        self.deleted.retain(|k| k.as_slice() != internal_key.as_slice());
+        self.deleted
+            .retain(|k| k.as_slice() != internal_key.as_slice());
         self.pending.insert(internal_key, value.to_vec());
         Ok(())
     }
@@ -963,7 +1001,12 @@ impl<'db> WriteTx<'db> {
     ///
     /// Returns `BucketNotFound` if the nested bucket doesn't exist.
     /// Returns `InvalidBucketName` if any name is invalid.
-    pub fn nested_bucket_put_at_path(&mut self, path: &[&[u8]], key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn nested_bucket_put_at_path(
+        &mut self,
+        path: &[&[u8]],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
         bucket::validate_nested_bucket_path(path)?;
 
         if !self.is_nested_bucket_present(path) {
@@ -973,7 +1016,8 @@ impl<'db> WriteTx<'db> {
         }
 
         let internal_key = bucket::nested_bucket_data_key(path, key);
-        self.deleted.retain(|k| k.as_slice() != internal_key.as_slice());
+        self.deleted
+            .retain(|k| k.as_slice() != internal_key.as_slice());
         self.pending.insert(internal_key, value.to_vec());
         Ok(())
     }
@@ -984,7 +1028,12 @@ impl<'db> WriteTx<'db> {
     ///
     /// Returns `BucketNotFound` if the nested bucket doesn't exist.
     /// Returns `InvalidBucketName` if any name is invalid.
-    pub fn nested_bucket_get(&self, parent: &[u8], child: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn nested_bucket_get(
+        &self,
+        parent: &[u8],
+        child: &[u8],
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
         bucket::validate_bucket_name(parent)?;
         bucket::validate_bucket_name(child)?;
 
@@ -1003,7 +1052,11 @@ impl<'db> WriteTx<'db> {
         }
 
         // Check if deleted.
-        if self.deleted.iter().any(|k| k.as_slice() == internal_key.as_slice()) {
+        if self
+            .deleted
+            .iter()
+            .any(|k| k.as_slice() == internal_key.as_slice())
+        {
             return Ok(None);
         }
 
@@ -1030,7 +1083,11 @@ impl<'db> WriteTx<'db> {
         let internal_key = bucket::nested_bucket_data_key(&path, key);
         self.pending.remove(&internal_key);
 
-        if !self.deleted.iter().any(|k| k.as_slice() == internal_key.as_slice()) {
+        if !self
+            .deleted
+            .iter()
+            .any(|k| k.as_slice() == internal_key.as_slice())
+        {
             self.deleted.push(internal_key);
         }
 
@@ -1039,7 +1096,9 @@ impl<'db> WriteTx<'db> {
 
     /// Checks if a nested bucket exists.
     pub fn nested_bucket_exists(&self, parent: &[u8], child: &[u8]) -> bool {
-        if bucket::validate_bucket_name(parent).is_err() || bucket::validate_bucket_name(child).is_err() {
+        if bucket::validate_bucket_name(parent).is_err()
+            || bucket::validate_bucket_name(child).is_err()
+        {
             return false;
         }
         self.is_nested_bucket_present(&[parent, child])
@@ -1084,10 +1143,10 @@ impl<'db> WriteTx<'db> {
                 continue;
             }
             // Verify parent matches and extract child name.
-            if let Some(child_name) = self.extract_nested_child_name(k, parent) {
-                if !buckets.contains(&child_name) {
-                    buckets.push(child_name);
-                }
+            if let Some(child_name) = self.extract_nested_child_name(k, parent)
+                && !buckets.contains(&child_name)
+            {
+                buckets.push(child_name);
             }
         }
 
@@ -1095,7 +1154,10 @@ impl<'db> WriteTx<'db> {
         buckets.retain(|child| {
             let path: [&[u8]; 2] = [parent, child];
             let meta_key = bucket::nested_bucket_meta_key(&path);
-            !self.deleted.iter().any(|k| k.as_slice() == meta_key.as_slice())
+            !self
+                .deleted
+                .iter()
+                .any(|k| k.as_slice() == meta_key.as_slice())
         });
 
         Ok(buckets)
@@ -1148,7 +1210,10 @@ impl<'db> WriteTx<'db> {
 
         // Check if any pending writes are updates to existing keys
         // Updates require full rewrite (especially for overflow values)
-        let has_updates = self.pending.iter().any(|(k, _)| self.db.tree().get(k).is_some());
+        let has_updates = self
+            .pending
+            .iter()
+            .any(|(k, _)| self.db.tree().get(k).is_some());
 
         // Apply deletions to main tree.
         for key in &self.deleted {
@@ -1183,10 +1248,7 @@ impl<'db> WriteTx<'db> {
         } else {
             // Append-only: use incremental persist for massive speedup.
             // First persist using references to avoid cloning for I/O.
-            let result = self.db.persist_incremental(
-                self.pending.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
-                false,
-            );
+            let result = self.db.persist_incremental(self.pending.iter(), false);
 
             if result.is_ok() {
                 // Apply pending insertions to main tree and update bloom filter.

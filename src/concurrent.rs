@@ -274,9 +274,7 @@ mod tests {
 
     #[test]
     fn test_compute_checksums_parallel() {
-        let data: Vec<Vec<u8>> = (0..200)
-            .map(|i| format!("data_{i}").into_bytes())
-            .collect();
+        let data: Vec<Vec<u8>> = (0..200).map(|i| format!("data_{i}").into_bytes()).collect();
 
         let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
 

@@ -135,10 +135,7 @@ fn test_cow_meta_page_alternation() {
         let mut db = Database::open(&path).expect("open");
         for i in 0..10 {
             let mut wtx = db.write_tx();
-            wtx.put(
-                format!("tx_{i}").as_bytes(),
-                format!("data_{i}").as_bytes(),
-            );
+            wtx.put(format!("tx_{i}").as_bytes(), format!("data_{i}").as_bytes());
             wtx.commit().expect("commit");
         }
     }
@@ -461,10 +458,7 @@ fn test_many_transactions() {
 
     for i in 0..100 {
         let mut wtx = db.write_tx();
-        wtx.put(
-            format!("tx_{i}").as_bytes(),
-            format!("data_{i}").as_bytes(),
-        );
+        wtx.put(format!("tx_{i}").as_bytes(), format!("data_{i}").as_bytes());
         wtx.commit().expect("commit should succeed");
     }
 
@@ -612,7 +606,10 @@ fn stress_rapid_transaction_churn() {
     for i in 0..tx_count {
         let mut wtx = db.write_tx();
         // Each transaction does multiple operations
-        wtx.put(format!("rapid_{i:06}").as_bytes(), format!("v{i}").as_bytes());
+        wtx.put(
+            format!("rapid_{i:06}").as_bytes(),
+            format!("v{i}").as_bytes(),
+        );
         wtx.put(b"counter", format!("{i}").as_bytes());
         // Keep some keys, delete others to create churn
         if i > 10 && i % 3 == 0 {
@@ -628,7 +625,10 @@ fn stress_rapid_transaction_churn() {
         Some(format!("{}", tx_count - 1).into_bytes())
     );
     // Last rapid key should exist
-    assert!(rtx.get(format!("rapid_{:06}", tx_count - 1).as_bytes()).is_some());
+    assert!(
+        rtx.get(format!("rapid_{:06}", tx_count - 1).as_bytes())
+            .is_some()
+    );
 
     cleanup(&path);
 }
@@ -756,8 +756,7 @@ fn correctness_data_integrity_heavy_churn() {
     };
 
     // Track expected state in memory
-    let mut expected: std::collections::HashMap<String, Vec<u8>> =
-        std::collections::HashMap::new();
+    let mut expected: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
 
     let operations = 500_000;
     let key_space = 10_000; // Keys 0-9999
@@ -876,15 +875,15 @@ fn stress_large_values() {
     let mut db = Database::open(&path).expect("open should succeed");
 
     let sizes = [
-        1,              // Tiny
-        100,            // Small
-        32768,          // Page size
-        32769,          // Just over page
-        65_536,         // 64KB
-        1_000_000,      // 1MB
-        10_000_000,     // 10MB
-        50_000_000,     // 50MB
-        100_000_000,    // 100MB
+        1,           // Tiny
+        100,         // Small
+        32768,       // Page size
+        32769,       // Just over page
+        65_536,      // 64KB
+        1_000_000,   // 1MB
+        10_000_000,  // 10MB
+        50_000_000,  // 50MB
+        100_000_000, // 100MB
     ];
 
     // Insert values of various sizes
@@ -919,11 +918,7 @@ fn stress_large_values() {
         let key = format!("size_{size}");
         let expected: Vec<u8> = (0..size).map(|j| ((i + j) % 256) as u8).collect();
         let actual = rtx.get(key.as_bytes());
-        assert_eq!(
-            actual,
-            Some(expected),
-            "key {key} corrupted after reopen"
-        );
+        assert_eq!(actual, Some(expected), "key {key} corrupted after reopen");
     }
 
     cleanup(&path);
@@ -1003,7 +998,8 @@ fn correctness_rollback_leaves_no_trace() {
             wtx.put(format!("base_{i:03}").as_bytes(), b"original");
         }
         wtx.create_bucket(b"stable_bucket").unwrap();
-        wtx.bucket_put(b"stable_bucket", b"bkey", b"bvalue").unwrap();
+        wtx.bucket_put(b"stable_bucket", b"bkey", b"bvalue")
+            .unwrap();
         wtx.commit().expect("commit should succeed");
     }
 
@@ -1074,8 +1070,7 @@ fn stress_mixed_workload_simulation() {
     };
 
     // Tracking for verification
-    let mut expected: std::collections::HashMap<String, Vec<u8>> =
-        std::collections::HashMap::new();
+    let mut expected: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
 
     // Simulate 10,000 "sessions" of activity
     for session in 0..10_000 {
@@ -1140,7 +1135,11 @@ fn stress_mixed_workload_simulation() {
 
     let db = Database::open(&path).expect("reopen should succeed");
     let rtx = db.read_tx();
-    assert_eq!(rtx.iter().count(), expected.len(), "count mismatch after reopen");
+    assert_eq!(
+        rtx.iter().count(),
+        expected.len(),
+        "count mismatch after reopen"
+    );
 
     cleanup(&path);
 }
@@ -1161,10 +1160,12 @@ fn test_nested_bucket_basic_crud() {
         wtx.create_nested_bucket(b"parent", b"child").unwrap();
 
         // Put data in parent bucket
-        wtx.bucket_put(b"parent", b"parent_key", b"parent_value").unwrap();
+        wtx.bucket_put(b"parent", b"parent_key", b"parent_value")
+            .unwrap();
 
         // Put data in nested bucket
-        wtx.nested_bucket_put(b"parent", b"child", b"child_key", b"child_value").unwrap();
+        wtx.nested_bucket_put(b"parent", b"child", b"child_key", b"child_value")
+            .unwrap();
 
         wtx.commit().expect("commit should succeed");
     }
@@ -1188,8 +1189,10 @@ fn test_nested_bucket_basic_crud() {
     // Update and delete in nested bucket
     {
         let mut wtx = db.write_tx();
-        wtx.nested_bucket_put(b"parent", b"child", b"child_key", b"updated_value").unwrap();
-        wtx.nested_bucket_put(b"parent", b"child", b"another_key", b"another_value").unwrap();
+        wtx.nested_bucket_put(b"parent", b"child", b"child_key", b"updated_value")
+            .unwrap();
+        wtx.nested_bucket_put(b"parent", b"child", b"another_key", b"another_value")
+            .unwrap();
         wtx.commit().expect("commit should succeed");
     }
 
@@ -1235,16 +1238,25 @@ fn test_nested_bucket_multi_level_hierarchy() {
         wtx.create_nested_bucket(b"root", b"level1").unwrap();
 
         // Create level2 under level1 (path: root/level1/level2)
-        wtx.create_nested_bucket_at_path(&[b"root", b"level1"], b"level2").unwrap();
+        wtx.create_nested_bucket_at_path(&[b"root", b"level1"], b"level2")
+            .unwrap();
 
         // Create level3 under level2 (path: root/level1/level2/level3)
-        wtx.create_nested_bucket_at_path(&[b"root", b"level1", b"level2"], b"level3").unwrap();
+        wtx.create_nested_bucket_at_path(&[b"root", b"level1", b"level2"], b"level3")
+            .unwrap();
 
         // Insert data at each level
         wtx.bucket_put(b"root", b"key", b"root_value").unwrap();
-        wtx.nested_bucket_put(b"root", b"level1", b"key", b"level1_value").unwrap();
-        wtx.nested_bucket_put_at_path(&[b"root", b"level1", b"level2"], b"key", b"level2_value").unwrap();
-        wtx.nested_bucket_put_at_path(&[b"root", b"level1", b"level2", b"level3"], b"key", b"level3_value").unwrap();
+        wtx.nested_bucket_put(b"root", b"level1", b"key", b"level1_value")
+            .unwrap();
+        wtx.nested_bucket_put_at_path(&[b"root", b"level1", b"level2"], b"key", b"level2_value")
+            .unwrap();
+        wtx.nested_bucket_put_at_path(
+            &[b"root", b"level1", b"level2", b"level3"],
+            b"key",
+            b"level3_value",
+        )
+        .unwrap();
 
         wtx.commit().expect("commit should succeed");
     }
@@ -1259,17 +1271,22 @@ fn test_nested_bucket_multi_level_hierarchy() {
         let level1 = rtx.nested_bucket(b"root", b"level1").unwrap();
         assert_eq!(level1.get(b"key"), Some(&b"level1_value"[..]));
 
-        let level2 = rtx.nested_bucket_at_path(&[b"root", b"level1", b"level2"]).unwrap();
+        let level2 = rtx
+            .nested_bucket_at_path(&[b"root", b"level1", b"level2"])
+            .unwrap();
         assert_eq!(level2.get(b"key"), Some(&b"level2_value"[..]));
 
-        let level3 = rtx.nested_bucket_at_path(&[b"root", b"level1", b"level2", b"level3"]).unwrap();
+        let level3 = rtx
+            .nested_bucket_at_path(&[b"root", b"level1", b"level2", b"level3"])
+            .unwrap();
         assert_eq!(level3.get(b"key"), Some(&b"level3_value"[..]));
     }
 
     // Delete intermediate level (level2) should delete level3 as well
     {
         let mut wtx = db.write_tx();
-        wtx.delete_nested_bucket_at_path(&[b"root", b"level1"], b"level2").unwrap();
+        wtx.delete_nested_bucket_at_path(&[b"root", b"level1"], b"level2")
+            .unwrap();
         wtx.commit().expect("commit should succeed");
     }
 
@@ -1309,9 +1326,12 @@ fn test_nested_bucket_sibling_isolation() {
         wtx.create_nested_bucket(b"parent", b"child_c").unwrap();
 
         // Same key in each sibling bucket with different values
-        wtx.nested_bucket_put(b"parent", b"child_a", b"shared_key", b"value_a").unwrap();
-        wtx.nested_bucket_put(b"parent", b"child_b", b"shared_key", b"value_b").unwrap();
-        wtx.nested_bucket_put(b"parent", b"child_c", b"shared_key", b"value_c").unwrap();
+        wtx.nested_bucket_put(b"parent", b"child_a", b"shared_key", b"value_a")
+            .unwrap();
+        wtx.nested_bucket_put(b"parent", b"child_b", b"shared_key", b"value_b")
+            .unwrap();
+        wtx.nested_bucket_put(b"parent", b"child_c", b"shared_key", b"value_c")
+            .unwrap();
 
         wtx.commit().expect("commit should succeed");
     }
@@ -1375,7 +1395,8 @@ fn test_nested_bucket_error_conditions() {
 
         // Error: Create nested bucket under non-existent parent
         assert!(matches!(
-            wtx.create_nested_bucket(b"nonexistent", b"child").unwrap_err(),
+            wtx.create_nested_bucket(b"nonexistent", b"child")
+                .unwrap_err(),
             Error::BucketNotFound { .. }
         ));
 
@@ -1393,13 +1414,15 @@ fn test_nested_bucket_error_conditions() {
 
         // Error: Access non-existent nested bucket
         assert!(matches!(
-            wtx.nested_bucket_put(b"parent", b"nonexistent", b"k", b"v").unwrap_err(),
+            wtx.nested_bucket_put(b"parent", b"nonexistent", b"k", b"v")
+                .unwrap_err(),
             Error::BucketNotFound { .. }
         ));
 
         // Error: Delete non-existent nested bucket
         assert!(matches!(
-            wtx.delete_nested_bucket(b"parent", b"nonexistent").unwrap_err(),
+            wtx.delete_nested_bucket(b"parent", b"nonexistent")
+                .unwrap_err(),
             Error::BucketNotFound { .. }
         ));
 
@@ -1437,13 +1460,18 @@ fn test_nested_bucket_persistence() {
         wtx.create_nested_bucket(b"config", b"storage").unwrap();
 
         wtx.bucket_put(b"config", b"version", b"1.0").unwrap();
-        wtx.nested_bucket_put(b"config", b"network", b"host", b"localhost").unwrap();
-        wtx.nested_bucket_put(b"config", b"network", b"port", b"8080").unwrap();
-        wtx.nested_bucket_put(b"config", b"storage", b"path", b"/data").unwrap();
+        wtx.nested_bucket_put(b"config", b"network", b"host", b"localhost")
+            .unwrap();
+        wtx.nested_bucket_put(b"config", b"network", b"port", b"8080")
+            .unwrap();
+        wtx.nested_bucket_put(b"config", b"storage", b"path", b"/data")
+            .unwrap();
 
         // Create a deeper nesting
-        wtx.create_nested_bucket_at_path(&[b"config", b"storage"], b"options").unwrap();
-        wtx.nested_bucket_put_at_path(&[b"config", b"storage", b"options"], b"compress", b"true").unwrap();
+        wtx.create_nested_bucket_at_path(&[b"config", b"storage"], b"options")
+            .unwrap();
+        wtx.nested_bucket_put_at_path(&[b"config", b"storage", b"options"], b"compress", b"true")
+            .unwrap();
 
         wtx.commit().expect("commit should succeed");
     }
@@ -1471,7 +1499,9 @@ fn test_nested_bucket_persistence() {
 
         // Check deeply nested bucket
         assert!(rtx.nested_bucket_exists_at_path(&[b"config", b"storage", b"options"]));
-        let options = rtx.nested_bucket_at_path(&[b"config", b"storage", b"options"]).unwrap();
+        let options = rtx
+            .nested_bucket_at_path(&[b"config", b"storage", b"options"])
+            .unwrap();
         assert_eq!(options.get(b"compress"), Some(&b"true"[..]));
 
         // List nested buckets

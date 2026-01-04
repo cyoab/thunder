@@ -22,10 +22,10 @@ fn cleanup(path: &str) {
 
 #[test]
 fn test_mmap_access_hint_sequential() {
-    use thunder::mmap::{Mmap, MmapOptions, AccessPattern};
-    use thunder::page::PAGE_SIZE;
-    use std::io::Write;
     use std::fs::OpenOptions;
+    use std::io::Write;
+    use thunder::mmap::{AccessPattern, Mmap, MmapOptions};
+    use thunder::page::PAGE_SIZE;
 
     let path = test_db_path("mmap_sequential");
     cleanup(&path);
@@ -61,11 +61,9 @@ fn test_mmap_access_hint_sequential() {
         .open(&path)
         .expect("open file");
 
-    let options = MmapOptions::new()
-        .with_access_pattern(AccessPattern::Sequential);
-    
-    let mmap = Mmap::with_options(&file, file_size, options)
-        .expect("mmap with sequential hint");
+    let options = MmapOptions::new().with_access_pattern(AccessPattern::Sequential);
+
+    let mmap = Mmap::with_options(&file, file_size, options).expect("mmap with sequential hint");
 
     // Read pages sequentially - kernel should prefetch ahead
     let mut sum: u64 = 0;
@@ -84,10 +82,10 @@ fn test_mmap_access_hint_sequential() {
 
 #[test]
 fn test_mmap_access_hint_random() {
-    use thunder::mmap::{Mmap, MmapOptions, AccessPattern};
-    use thunder::page::PAGE_SIZE;
-    use std::io::Write;
     use std::fs::OpenOptions;
+    use std::io::Write;
+    use thunder::mmap::{AccessPattern, Mmap, MmapOptions};
+    use thunder::page::PAGE_SIZE;
 
     let path = test_db_path("mmap_random");
     cleanup(&path);
@@ -117,11 +115,9 @@ fn test_mmap_access_hint_random() {
         .open(&path)
         .expect("open file");
 
-    let options = MmapOptions::new()
-        .with_access_pattern(AccessPattern::Random);
-    
-    let mmap = Mmap::with_options(&file, file_size, options)
-        .expect("mmap with random hint");
+    let options = MmapOptions::new().with_access_pattern(AccessPattern::Random);
+
+    let mmap = Mmap::with_options(&file, file_size, options).expect("mmap with random hint");
 
     // Access pages in random order
     let random_order = [15, 3, 28, 7, 22, 1, 30, 10, 19, 5];
@@ -136,10 +132,10 @@ fn test_mmap_access_hint_random() {
 
 #[test]
 fn test_mmap_prefetch() {
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use thunder::mmap::Mmap;
     use thunder::page::PAGE_SIZE;
-    use std::io::Write;
-    use std::fs::OpenOptions;
 
     let path = test_db_path("mmap_prefetch");
     cleanup(&path);
@@ -175,7 +171,7 @@ fn test_mmap_prefetch() {
     let prefetch_start = 10;
     let prefetch_pages = 8;
     let prefetch_len = prefetch_pages * PAGE_SIZE;
-    
+
     // This should hint to the kernel to bring pages into memory
     mmap.prefetch(prefetch_start * PAGE_SIZE, prefetch_len);
 
@@ -191,10 +187,10 @@ fn test_mmap_prefetch() {
 
 #[test]
 fn test_mmap_populate_flag() {
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use thunder::mmap::{Mmap, MmapOptions};
     use thunder::page::PAGE_SIZE;
-    use std::io::Write;
-    use std::fs::OpenOptions;
 
     let path = test_db_path("mmap_populate");
     cleanup(&path);
@@ -226,8 +222,7 @@ fn test_mmap_populate_flag() {
 
     // Create mmap with populate flag - pages should be pre-faulted
     let options = MmapOptions::new().with_populate(true);
-    let mmap = Mmap::with_options(&file, file_size, options)
-        .expect("mmap with populate");
+    let mmap = Mmap::with_options(&file, file_size, options).expect("mmap with populate");
 
     // All pages should already be resident - verify they're accessible
     for page_num in 0..pages as u64 {
@@ -246,19 +241,19 @@ fn test_arena_cache_line_alignment() {
     use thunder::arena::Arena;
 
     let mut arena = Arena::new(4096);
-    
+
     // Allocate with cache line alignment (64 bytes on most modern CPUs)
     // Store pointers before making new allocations to avoid borrow conflicts
     let ptr1 = {
         let slice = arena.alloc_aligned(128, 64);
         slice.as_ptr() as usize
     };
-    
+
     let ptr2 = {
         let slice = arena.alloc_aligned(256, 64);
         slice.as_ptr() as usize
     };
-    
+
     let ptr3 = {
         let slice = arena.alloc_aligned(64, 64);
         slice.as_ptr() as usize
@@ -283,11 +278,11 @@ fn test_arena_page_alignment() {
 
     // Allocate with page alignment
     let page_aligned = arena.alloc_aligned(PAGE_SIZE, PAGE_SIZE);
-    
+
     assert_eq!(page_aligned.len(), PAGE_SIZE);
     assert_eq!(
-        page_aligned.as_ptr() as usize % PAGE_SIZE, 
-        0, 
+        page_aligned.as_ptr() as usize % PAGE_SIZE,
+        0,
         "allocation not page-aligned"
     );
 }
@@ -296,10 +291,10 @@ fn test_arena_page_alignment() {
 
 #[test]
 fn test_mmap_dontneed_hint() {
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use thunder::mmap::Mmap;
     use thunder::page::PAGE_SIZE;
-    use std::io::Write;
-    use std::fs::OpenOptions;
 
     let path = test_db_path("mmap_dontneed");
     cleanup(&path);
@@ -359,7 +354,7 @@ fn test_database_with_sequential_mmap() {
     {
         let mut db = Database::open_with_options(&path, DatabaseOptions::default())
             .expect("open should succeed");
-        
+
         // Insert enough keys to span multiple pages
         {
             let mut wtx = db.write_tx();
@@ -376,7 +371,7 @@ fn test_database_with_sequential_mmap() {
     {
         let db = Database::open(&path).expect("reopen should succeed");
         let rtx = db.read_tx();
-        
+
         // Sequential scan (benefits from sequential hint)
         for i in 0..1000 {
             let key = format!("key_{i:05}");
@@ -390,10 +385,10 @@ fn test_database_with_sequential_mmap() {
 
 #[test]
 fn test_large_file_mmap_performance() {
-    use thunder::mmap::{Mmap, MmapOptions, AccessPattern};
-    use thunder::page::PAGE_SIZE;
-    use std::io::Write;
     use std::fs::OpenOptions;
+    use std::io::Write;
+    use thunder::mmap::{AccessPattern, Mmap, MmapOptions};
+    use thunder::page::PAGE_SIZE;
 
     let path = test_db_path("mmap_large_perf");
     cleanup(&path);
@@ -424,10 +419,8 @@ fn test_large_file_mmap_performance() {
         .expect("open file");
 
     // Test with sequential hint
-    let options = MmapOptions::new()
-        .with_access_pattern(AccessPattern::Sequential);
-    let mmap = Mmap::with_options(&file, file_size, options)
-        .expect("mmap with sequential");
+    let options = MmapOptions::new().with_access_pattern(AccessPattern::Sequential);
+    let mmap = Mmap::with_options(&file, file_size, options).expect("mmap with sequential");
 
     // Sequential read - should benefit from kernel readahead
     let start = Instant::now();
@@ -442,8 +435,11 @@ fn test_large_file_mmap_performance() {
     assert_eq!(checksum, (0..pages as u64).fold(0, |acc, x| acc ^ x));
 
     // Print timing for benchmarking purposes (not a hard assertion)
-    println!("Sequential read of {pages} pages ({} MB): {:?}", 
-             (pages * PAGE_SIZE) / (1024 * 1024), sequential_time);
+    println!(
+        "Sequential read of {pages} pages ({} MB): {:?}",
+        (pages * PAGE_SIZE) / (1024 * 1024),
+        sequential_time
+    );
 
     cleanup(&path);
 }

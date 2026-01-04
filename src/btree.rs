@@ -330,26 +330,21 @@ impl BTree {
     /// Removes a key from a node.
     ///
     /// Returns (optional_updated_node, optional_removed_value).
-    fn remove_from_node(
-        mut node: Box<Node>,
-        key: &[u8],
-    ) -> (Option<Box<Node>>, Option<Vec<u8>>) {
+    fn remove_from_node(mut node: Box<Node>, key: &[u8]) -> (Option<Box<Node>>, Option<Vec<u8>>) {
         match node.as_mut() {
-            Node::Leaf(leaf) => {
-                match leaf.keys.binary_search_by(|k| k.as_slice().cmp(key)) {
-                    Ok(idx) => {
-                        leaf.keys.remove(idx);
-                        let value = leaf.values.remove(idx);
+            Node::Leaf(leaf) => match leaf.keys.binary_search_by(|k| k.as_slice().cmp(key)) {
+                Ok(idx) => {
+                    leaf.keys.remove(idx);
+                    let value = leaf.values.remove(idx);
 
-                        if leaf.keys.is_empty() {
-                            (None, Some(value))
-                        } else {
-                            (Some(node), Some(value))
-                        }
+                    if leaf.keys.is_empty() {
+                        (None, Some(value))
+                    } else {
+                        (Some(node), Some(value))
                     }
-                    Err(_) => (Some(node), None),
                 }
-            }
+                Err(_) => (Some(node), None),
+            },
             Node::Branch(branch) => {
                 let child_idx = Self::find_child_index(&branch.keys, key);
                 let child = branch.children.remove(child_idx);

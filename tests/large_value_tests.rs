@@ -168,8 +168,8 @@ fn test_variable_page_size_configuration() {
 
         // Reopen with same page size - should work
         {
-            let db = Database::open_with_options(&path, options.clone())
-                .expect("reopen should succeed");
+            let db =
+                Database::open_with_options(&path, options.clone()).expect("reopen should succeed");
             let rtx = db.read_tx();
 
             for i in 0..50 {
@@ -225,8 +225,8 @@ fn test_variable_page_size_configuration() {
             "NVMe preset should use 32KB HPC pages"
         );
 
-        let mut db = Database::open_with_options(&nvme_path, options)
-            .expect("NVMe optimized should work");
+        let mut db =
+            Database::open_with_options(&nvme_path, options).expect("NVMe optimized should work");
         let mut wtx = db.write_tx();
         wtx.put(b"nvme_key", b"nvme_value");
         wtx.commit().expect("commit should succeed");
@@ -353,8 +353,7 @@ fn test_write_coalescing_and_batch_io() {
         let stress_path = test_db_path("stress_coalesce");
         cleanup(&stress_path);
 
-        let mut db = Database::open_with_options(&stress_path, options)
-            .expect("open stress db");
+        let mut db = Database::open_with_options(&stress_path, options).expect("open stress db");
         let mut wtx = db.write_tx();
 
         // Write enough data to exceed buffer multiple times
@@ -395,8 +394,8 @@ fn test_large_value_combined_features() {
 
     // Create database with all Phase 2 features
     {
-        let mut db = Database::open_with_options(&path, options.clone())
-            .expect("open should succeed");
+        let mut db =
+            Database::open_with_options(&path, options.clone()).expect("open should succeed");
 
         let mut wtx = db.write_tx();
 
@@ -404,9 +403,9 @@ fn test_large_value_combined_features() {
         for i in 0..100 {
             let key = format!("combined_{i:04}");
             let value = match i % 10 {
-                0 => vec![0xAAu8; 50 * 1024], // 50KB - large overflow
+                0 => vec![0xAAu8; 50 * 1024],    // 50KB - large overflow
                 1..=3 => vec![0xBBu8; 5 * 1024], // 5KB - small overflow
-                _ => vec![0xCCu8; 500], // 500B - inline
+                _ => vec![0xCCu8; 500],          // 500B - inline
             };
             wtx.put(key.as_bytes(), &value);
         }
@@ -416,8 +415,7 @@ fn test_large_value_combined_features() {
 
     // Verify everything persisted correctly
     {
-        let db = Database::open_with_options(&path, options)
-            .expect("reopen should succeed");
+        let db = Database::open_with_options(&path, options).expect("reopen should succeed");
         let rtx = db.read_tx();
 
         for i in 0..100 {

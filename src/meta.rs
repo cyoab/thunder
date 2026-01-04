@@ -2,7 +2,7 @@
 //! Copyright (c) YOAB. All rights reserved.
 
 use crate::checkpoint::CheckpointInfo;
-use crate::page::{PageId, PageSizeConfig, MAGIC, PAGE_SIZE, VERSION};
+use crate::page::{MAGIC, PAGE_SIZE, PageId, PageSizeConfig, VERSION};
 use crate::wal::Lsn;
 
 /// Meta page structure stored at the beginning of the database file.
@@ -83,9 +83,7 @@ impl Meta {
     ///
     /// Checks magic number, version, and that page size is valid.
     pub fn validate(&self) -> bool {
-        self.magic == MAGIC
-            && self.version <= VERSION
-            && PageSizeConfig::is_valid(self.page_size)
+        self.magic == MAGIC && self.version <= VERSION && PageSizeConfig::is_valid(self.page_size)
     }
 
     /// Validates the meta page against an expected page size.

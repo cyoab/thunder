@@ -185,9 +185,7 @@ impl WalRecord {
         if computed_crc != stored_crc {
             return Err(Error::WalRecordInvalid {
                 lsn: 0,
-                reason: format!(
-                    "CRC mismatch: stored {stored_crc:#x}, computed {computed_crc:#x}"
-                ),
+                reason: format!("CRC mismatch: stored {stored_crc:#x}, computed {computed_crc:#x}"),
             });
         }
 
@@ -214,9 +212,9 @@ impl WalRecord {
                 buf.extend_from_slice(key);
                 buf
             }
-            WalRecord::TxBegin { txid } | WalRecord::TxCommit { txid } | WalRecord::TxAbort { txid } => {
-                txid.to_le_bytes().to_vec()
-            }
+            WalRecord::TxBegin { txid }
+            | WalRecord::TxCommit { txid }
+            | WalRecord::TxAbort { txid } => txid.to_le_bytes().to_vec(),
             WalRecord::Checkpoint { lsn } => lsn.to_le_bytes().to_vec(),
         }
     }

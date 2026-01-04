@@ -17,7 +17,7 @@ use crate::page::PageId;
 
 /// Default threshold for storing values in overflow pages.
 /// Values larger than this are stored in overflow chains.
-/// 
+///
 /// Set to 16KB by default - optimized for 32KB HPC page size.
 /// Most "large" values will be stored inline, avoiding overflow
 /// page chain overhead. Only truly large values use overflow storage.
@@ -77,16 +77,16 @@ impl OverflowHeader {
     }
 
     /// Writes the header directly to a buffer using unsafe pointer operations.
-    /// 
+    ///
     /// This is faster than `to_bytes()` + copy because it avoids an intermediate buffer.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// - `buffer` must have at least `Self::SIZE` bytes available
     /// - `buffer` should be properly aligned (though this function handles misalignment)
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `buffer` - The buffer to write the header into
     #[inline]
     pub unsafe fn write_to_buffer_unchecked(&self, buffer: &mut [u8]) {
@@ -97,30 +97,18 @@ impl OverflowHeader {
         unsafe {
             // Write page_type at offset 0
             *buffer.get_unchecked_mut(0) = self.page_type;
-            
+
             // Write next_page as little-endian u64 at offset 8
             let next_page_bytes = self.next_page.to_le_bytes();
-            std::ptr::copy_nonoverlapping(
-                next_page_bytes.as_ptr(),
-                buffer.as_mut_ptr().add(8),
-                8
-            );
-            
+            std::ptr::copy_nonoverlapping(next_page_bytes.as_ptr(), buffer.as_mut_ptr().add(8), 8);
+
             // Write data_len as little-endian u32 at offset 16
             let data_len_bytes = self.data_len.to_le_bytes();
-            std::ptr::copy_nonoverlapping(
-                data_len_bytes.as_ptr(),
-                buffer.as_mut_ptr().add(16),
-                4
-            );
-            
+            std::ptr::copy_nonoverlapping(data_len_bytes.as_ptr(), buffer.as_mut_ptr().add(16), 4);
+
             // Write checksum as little-endian u32 at offset 20
             let checksum_bytes = self.checksum.to_le_bytes();
-            std::ptr::copy_nonoverlapping(
-                checksum_bytes.as_ptr(),
-                buffer.as_mut_ptr().add(20),
-                4
-            );
+            std::ptr::copy_nonoverlapping(checksum_bytes.as_ptr(), buffer.as_mut_ptr().add(20), 4);
         }
     }
 
@@ -260,10 +248,7 @@ impl OverflowManager {
     pub fn allocate_overflow(&mut self, value: &[u8]) -> (OverflowRef, Vec<(PageId, Vec<u8>)>) {
         if value.is_empty() {
             // Edge case: empty value shouldn't use overflow, but handle gracefully
-            return (
-                OverflowRef::new(0, 0),
-                Vec::new(),
-            );
+            return (OverflowRef::new(0, 0), Vec::new());
         }
 
         let mut pages = Vec::new();
@@ -345,8 +330,12 @@ impl OverflowManager {
 
         let value = &data[8..8 + stored_len];
         let crc_offset = 8 + stored_len;
-        let stored_crc =
-            u32::from_le_bytes([data[crc_offset], data[crc_offset + 1], data[crc_offset + 2], data[crc_offset + 3]]);
+        let stored_crc = u32::from_le_bytes([
+            data[crc_offset],
+            data[crc_offset + 1],
+            data[crc_offset + 2],
+            data[crc_offset + 3],
+        ]);
 
         // Verify checksum
         if !Self::verify_checksum(value, stored_crc) {
@@ -382,14 +371,19 @@ impl OverflowManager {
         // First try direct format - treat start_page as byte offset
         let byte_offset = overflow_ref.start_page as usize;
 
-        if byte_offset < mmap.len() {
-            if let Some(header_data) = mmap.slice(byte_offset, 4) {
-                let stored_magic = u32::from_le_bytes([header_data[0], header_data[1], header_data[2], header_data[3]]);
-                if stored_magic == Self::DIRECT_FORMAT_MAGIC {
-                    // Direct format detected - use fast read
-                    if let Some(result) = self.read_direct(overflow_ref, mmap) {
-                        return Some(result);
-                    }
+        if byte_offset < mmap.len()
+            && let Some(header_data) = mmap.slice(byte_offset, 4)
+        {
+            let stored_magic = u32::from_le_bytes([
+                header_data[0],
+                header_data[1],
+                header_data[2],
+                header_data[3],
+            ]);
+            if stored_magic == Self::DIRECT_FORMAT_MAGIC {
+                // Direct format detected - use fast read
+                if let Some(result) = self.read_direct(overflow_ref, mmap) {
+                    return Some(result);
                 }
             }
         }
@@ -437,10 +431,10 @@ impl OverflowManager {
         }
 
         // Verify checksum of entire value (stored in first page header)
-        if let Some(checksum) = stored_checksum {
-            if !Self::verify_checksum(&result, checksum) {
-                return None; // Data corruption detected
-            }
+        if let Some(checksum) = stored_checksum
+            && !Self::verify_checksum(&result, checksum)
+        {
+            return None; // Data corruption detected
         }
 
         Some(result)
@@ -568,10 +562,10 @@ impl OverflowManager {
         }
 
         // Verify checksum of entire value
-        if let Some(checksum) = stored_checksum {
-            if !Self::verify_checksum(&result, checksum) {
-                return None;
-            }
+        if let Some(checksum) = stored_checksum
+            && !Self::verify_checksum(&result, checksum)
+        {
+            return None;
         }
 
         Some(result)
@@ -677,7 +671,8 @@ impl OverflowManager {
             let page_offset = page_idx * self.page_size;
             buffer[page_offset..page_offset + OVERFLOW_HEADER_SIZE]
                 .copy_from_slice(&header.to_bytes());
-            buffer[page_offset + OVERFLOW_HEADER_SIZE..page_offset + OVERFLOW_HEADER_SIZE + chunk_len]
+            buffer[page_offset + OVERFLOW_HEADER_SIZE
+                ..page_offset + OVERFLOW_HEADER_SIZE + chunk_len]
                 .copy_from_slice(chunk);
         }
 
@@ -740,17 +735,17 @@ impl OverflowManager {
             let header = OverflowHeader::new(next_page, chunk_len as u32, checksum);
 
             let page_offset = offset + page_idx * self.page_size;
-            
+
             // SAFETY: We allocated `total_size` bytes which guarantees sufficient space.
             // Each page_offset is page_size-aligned within the buffer.
             unsafe {
                 header.write_to_buffer_unchecked(&mut buffer[page_offset..]);
-                
+
                 // Use ptr::copy_nonoverlapping for the data copy (faster than slice copy for larger chunks)
                 std::ptr::copy_nonoverlapping(
                     chunk.as_ptr(),
                     buffer.as_mut_ptr().add(page_offset + OVERFLOW_HEADER_SIZE),
-                    chunk_len
+                    chunk_len,
                 );
             }
         }
@@ -796,18 +791,19 @@ impl OverflowManager {
         }
 
         let total_size = value.len() + 12; // 4 bytes magic + 4 bytes length + 4 bytes CRC
-        
+
         // For direct format, store the exact byte offset where data is written
         // (This differs from legacy format which stores page numbers)
         let file_offset = file_base_offset + buffer_offset as u64;
-        
+
         // Write magic marker
-        buffer[buffer_offset..buffer_offset + 4].copy_from_slice(&Self::DIRECT_FORMAT_MAGIC.to_le_bytes());
-        
+        buffer[buffer_offset..buffer_offset + 4]
+            .copy_from_slice(&Self::DIRECT_FORMAT_MAGIC.to_le_bytes());
+
         // Write length header (at buffer_offset+4)
         let len_bytes = (value.len() as u32).to_le_bytes();
         buffer[buffer_offset + 4..buffer_offset + 8].copy_from_slice(&len_bytes);
-        
+
         // Write value data using fast copy (at buffer_offset+8)
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -816,16 +812,16 @@ impl OverflowManager {
                 value.len(),
             );
         }
-        
+
         // Write CRC32 trailer
         #[cfg(not(feature = "no_checksum"))]
         let checksum = crc32fast::hash(value);
         #[cfg(feature = "no_checksum")]
         let checksum = 0u32;
-        
+
         let crc_offset = buffer_offset + 8 + value.len();
         buffer[crc_offset..crc_offset + 4].copy_from_slice(&checksum.to_le_bytes());
-        
+
         // Store byte offset in start_page (repurposed for direct format)
         let oref = OverflowRef::new(file_offset, value.len() as u32);
         (oref, total_size)
@@ -870,7 +866,7 @@ impl OverflowManager {
             let _ = data;
             0
         }
-        
+
         #[cfg(not(feature = "no_checksum"))]
         {
             // Use SIMD-accelerated CRC32 from crc32fast
@@ -889,7 +885,7 @@ impl OverflowManager {
             let _ = expected;
             true
         }
-        
+
         #[cfg(not(feature = "no_checksum"))]
         {
             crc32fast::hash(data) == expected
@@ -959,10 +955,13 @@ mod tests {
 
         assert_eq!(checksum1, checksum2);
 
-        // Different data should have different checksum
-        let other_data = b"Hello, World?";
-        let checksum3 = OverflowManager::compute_checksum(other_data);
-        assert_ne!(checksum1, checksum3);
+        // Different data should have different checksum (only when checksums are enabled)
+        #[cfg(not(feature = "no_checksum"))]
+        {
+            let other_data = b"Hello, World?";
+            let checksum3 = OverflowManager::compute_checksum(other_data);
+            assert_ne!(checksum1, checksum3);
+        }
     }
 
     #[test]

@@ -115,9 +115,18 @@ mod tests {
 
         assert_eq!(PageSizeConfig::from_u32(4096), Some(PageSizeConfig::Size4K));
         assert_eq!(PageSizeConfig::from_u32(8192), Some(PageSizeConfig::Size8K));
-        assert_eq!(PageSizeConfig::from_u32(16384), Some(PageSizeConfig::Size16K));
-        assert_eq!(PageSizeConfig::from_u32(32768), Some(PageSizeConfig::Size32K));
-        assert_eq!(PageSizeConfig::from_u32(65536), Some(PageSizeConfig::Size64K));
+        assert_eq!(
+            PageSizeConfig::from_u32(16384),
+            Some(PageSizeConfig::Size16K)
+        );
+        assert_eq!(
+            PageSizeConfig::from_u32(32768),
+            Some(PageSizeConfig::Size32K)
+        );
+        assert_eq!(
+            PageSizeConfig::from_u32(65536),
+            Some(PageSizeConfig::Size64K)
+        );
         assert_eq!(PageSizeConfig::from_u32(1024), None);
         assert_eq!(PageSizeConfig::from_u32(0), None);
 

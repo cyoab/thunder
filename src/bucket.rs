@@ -328,7 +328,11 @@ pub fn create_nested_bucket(tree: &mut BTree, path: &[&[u8]]) -> Result<()> {
         let parent_path = &path[..path.len() - 1];
         if !nested_bucket_exists(tree, parent_path) {
             return Err(Error::BucketNotFound {
-                name: parent_path.iter().map(|p| p.to_vec()).collect::<Vec<_>>().concat(),
+                name: parent_path
+                    .iter()
+                    .map(|p| p.to_vec())
+                    .collect::<Vec<_>>()
+                    .concat(),
             });
         }
     }
@@ -368,7 +372,11 @@ pub fn create_nested_bucket_if_not_exists(tree: &mut BTree, path: &[&[u8]]) -> R
         let parent_path = &path[..path.len() - 1];
         if !nested_bucket_exists(tree, parent_path) {
             return Err(Error::BucketNotFound {
-                name: parent_path.iter().map(|p| p.to_vec()).collect::<Vec<_>>().concat(),
+                name: parent_path
+                    .iter()
+                    .map(|p| p.to_vec())
+                    .collect::<Vec<_>>()
+                    .concat(),
             });
         }
     }
@@ -416,7 +424,10 @@ pub fn delete_nested_bucket(tree: &mut BTree, path: &[&[u8]]) -> Result<()> {
             }
             // Match nested bucket metadata for children.
             // We need to check if this key represents a child nested bucket.
-            if k.first() == Some(&NESTED_BUCKET_META_PREFIX) && k.starts_with(&meta_prefix) && k.len() > meta_prefix.len() {
+            if k.first() == Some(&NESTED_BUCKET_META_PREFIX)
+                && k.starts_with(&meta_prefix)
+                && k.len() > meta_prefix.len()
+            {
                 return Some(k.to_vec());
             }
             // Also match child data under NESTED_BUCKET_DATA_PREFIX with longer paths.
@@ -943,11 +954,17 @@ mod tests {
 
         assert!(create_bucket(&mut tree, b"test").is_ok());
         assert!(bucket_exists(&tree, b"test"));
-        assert!(matches!(create_bucket(&mut tree, b"test").unwrap_err(), Error::BucketAlreadyExists { .. }));
+        assert!(matches!(
+            create_bucket(&mut tree, b"test").unwrap_err(),
+            Error::BucketAlreadyExists { .. }
+        ));
 
         assert!(delete_bucket(&mut tree, b"test").is_ok());
         assert!(!bucket_exists(&tree, b"test"));
-        assert!(matches!(delete_bucket(&mut tree, b"test").unwrap_err(), Error::BucketNotFound { .. }));
+        assert!(matches!(
+            delete_bucket(&mut tree, b"test").unwrap_err(),
+            Error::BucketNotFound { .. }
+        ));
     }
 
     #[test]

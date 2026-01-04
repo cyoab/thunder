@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::wal_record::{WalRecord, RECORD_HEADER_SIZE};
+use crate::wal_record::{RECORD_HEADER_SIZE, WalRecord};
 
 /// Default WAL segment size (64MB).
 pub const WAL_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
@@ -96,11 +96,12 @@ impl WalSegment {
             first_lsn,
         };
         let header_bytes = header.to_bytes();
-        file.write_all(&header_bytes).map_err(|e| Error::WalCorrupted {
-            segment_id,
-            offset: 0,
-            reason: format!("failed to write header: {e}"),
-        })?;
+        file.write_all(&header_bytes)
+            .map_err(|e| Error::WalCorrupted {
+                segment_id,
+                offset: 0,
+                reason: format!("failed to write header: {e}"),
+            })?;
 
         Ok(Self {
             file,
@@ -126,11 +127,12 @@ impl WalSegment {
 
         // Read and validate header
         let mut header_buf = [0u8; SEGMENT_HEADER_SIZE as usize];
-        file.read_exact(&mut header_buf).map_err(|e| Error::WalCorrupted {
-            segment_id,
-            offset: 0,
-            reason: format!("failed to read header: {e}"),
-        })?;
+        file.read_exact(&mut header_buf)
+            .map_err(|e| Error::WalCorrupted {
+                segment_id,
+                offset: 0,
+                reason: format!("failed to read header: {e}"),
+            })?;
 
         let header = SegmentHeader::from_bytes(&header_buf).ok_or_else(|| Error::WalCorrupted {
             segment_id,
@@ -150,20 +152,24 @@ impl WalSegment {
         }
 
         // Find write offset (end of valid data)
-        let file_len = file.metadata().map_err(|e| Error::WalCorrupted {
-            segment_id,
-            offset: 0,
-            reason: format!("failed to get metadata: {e}"),
-        })?.len();
+        let file_len = file
+            .metadata()
+            .map_err(|e| Error::WalCorrupted {
+                segment_id,
+                offset: 0,
+                reason: format!("failed to get metadata: {e}"),
+            })?
+            .len();
 
         let write_offset = Self::find_write_offset(&mut file, segment_id, file_len)?;
 
         // Seek to write position
-        file.seek(SeekFrom::Start(write_offset)).map_err(|e| Error::WalCorrupted {
-            segment_id,
-            offset: write_offset,
-            reason: format!("failed to seek: {e}"),
-        })?;
+        file.seek(SeekFrom::Start(write_offset))
+            .map_err(|e| Error::WalCorrupted {
+                segment_id,
+                offset: write_offset,
+                reason: format!("failed to seek: {e}"),
+            })?;
 
         Ok(Self {
             file,
@@ -178,11 +184,12 @@ impl WalSegment {
         let mut offset = SEGMENT_HEADER_SIZE;
 
         while offset < file_len {
-            file.seek(SeekFrom::Start(offset)).map_err(|e| Error::WalCorrupted {
-                segment_id,
-                offset,
-                reason: format!("seek error: {e}"),
-            })?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| Error::WalCorrupted {
+                    segment_id,
+                    offset,
+                    reason: format!("seek error: {e}"),
+                })?;
 
             // Try to read record length
             let mut len_buf = [0u8; 4];
@@ -207,11 +214,12 @@ impl WalSegment {
             }
 
             // Read full record and validate CRC
-            file.seek(SeekFrom::Start(offset)).map_err(|e| Error::WalCorrupted {
-                segment_id,
-                offset,
-                reason: format!("seek error: {e}"),
-            })?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| Error::WalCorrupted {
+                    segment_id,
+                    offset,
+                    reason: format!("seek error: {e}"),
+                })?;
 
             let mut record_buf = vec![0u8; record_len as usize];
             match file.read_exact(&mut record_buf) {
@@ -368,7 +376,9 @@ impl Wal {
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
                 && name.starts_with("wal_")
                 && name.ends_with(".log")
-                && let Some(id_str) = name.strip_prefix("wal_").and_then(|s| s.strip_suffix(".log"))
+                && let Some(id_str) = name
+                    .strip_prefix("wal_")
+                    .and_then(|s| s.strip_suffix(".log"))
                 && let Ok(id) = id_str.parse::<u64>()
             {
                 segments.push(id);
@@ -390,7 +400,10 @@ impl Wal {
             self.rotate_segment()?;
         }
 
-        let lsn = self.make_lsn(self.current_segment.segment_id, self.current_segment.write_offset);
+        let lsn = self.make_lsn(
+            self.current_segment.segment_id,
+            self.current_segment.write_offset,
+        );
 
         self.current_segment.append(&data)?;
         self.pending_bytes += data.len() as u64;
@@ -426,7 +439,10 @@ impl Wal {
 
     /// Returns the current LSN (next write position).
     pub fn current_lsn(&self) -> Lsn {
-        self.make_lsn(self.current_segment.segment_id, self.current_segment.write_offset)
+        self.make_lsn(
+            self.current_segment.segment_id,
+            self.current_segment.write_offset,
+        )
     }
 
     /// Truncates WAL segments before the given LSN.

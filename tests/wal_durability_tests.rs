@@ -4,15 +4,15 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use thunder::wal::{SyncPolicy, Wal, WalConfig};
-use thunder::wal_record::WalRecord;
 use thunder::checkpoint::{CheckpointConfig, CheckpointManager};
 use thunder::group_commit::{GroupCommitConfig, GroupCommitManager};
+use thunder::wal::{SyncPolicy, Wal, WalConfig};
+use thunder::wal_record::WalRecord;
 use thunder::{Database, DatabaseOptions};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -20,10 +20,7 @@ static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn unique_test_path(prefix: &str) -> PathBuf {
     let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
-    PathBuf::from(format!(
-        "/tmp/thunder_wal_test_{}_{pid}_{counter}",
-        prefix
-    ))
+    PathBuf::from(format!("/tmp/thunder_wal_test_{}_{pid}_{counter}", prefix))
 }
 
 fn cleanup_dir(path: &PathBuf) {
@@ -67,7 +64,9 @@ mod wal_integrity_and_recovery {
             },
             WalRecord::TxCommit { txid: 1 },
             WalRecord::TxAbort { txid: 2 },
-            WalRecord::Checkpoint { lsn: 0x1234567890ABCDEF },
+            WalRecord::Checkpoint {
+                lsn: 0x1234567890ABCDEF,
+            },
         ];
 
         for original in &records {
@@ -77,8 +76,8 @@ mod wal_integrity_and_recovery {
             assert!(encoded.len() >= thunder::wal_record::RECORD_HEADER_SIZE);
 
             // Decode and verify roundtrip
-            let (decoded, consumed) = WalRecord::decode(&encoded)
-                .expect("decode should succeed for valid record");
+            let (decoded, consumed) =
+                WalRecord::decode(&encoded).expect("decode should succeed for valid record");
             assert_eq!(consumed, encoded.len());
 
             match (original, &decoded) {
@@ -271,11 +270,7 @@ mod wal_integrity_and_recovery {
         let segments: Vec<_> = fs::read_dir(&wal_dir)
             .expect("read WAL dir")
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "log")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
             .collect();
 
         assert!(
@@ -536,14 +531,17 @@ mod checkpoint_recovery {
                 })
                 .expect("append");
             }
-            wal.append(&WalRecord::TxCommit { txid: 1 }).expect("commit");
+            wal.append(&WalRecord::TxCommit { txid: 1 })
+                .expect("commit");
             wal.sync().expect("sync");
 
             checkpoint_lsn = wal.current_lsn();
 
             // Create checkpoint
-            wal.append(&WalRecord::Checkpoint { lsn: checkpoint_lsn })
-                .expect("checkpoint record");
+            wal.append(&WalRecord::Checkpoint {
+                lsn: checkpoint_lsn,
+            })
+            .expect("checkpoint record");
 
             // Truncate WAL before checkpoint
             wal.truncate_before(checkpoint_lsn).expect("truncate");
@@ -560,7 +558,8 @@ mod checkpoint_recovery {
                 })
                 .expect("append");
             }
-            wal.append(&WalRecord::TxCommit { txid: 2 }).expect("commit");
+            wal.append(&WalRecord::TxCommit { txid: 2 })
+                .expect("commit");
             wal.sync().expect("sync");
         }
 
@@ -674,8 +673,8 @@ mod checkpoint_recovery {
 
         // Phase 1: Write data and create checkpoint
         {
-            let mut db = Database::open_with_options(&db_path, options.clone())
-                .expect("open database");
+            let mut db =
+                Database::open_with_options(&db_path, options.clone()).expect("open database");
 
             // Write batch 1
             {
@@ -707,27 +706,20 @@ mod checkpoint_recovery {
 
         // Phase 2: Simulate crash and recover
         {
-            let db = Database::open_with_options(&db_path, options)
-                .expect("recover database");
+            let db = Database::open_with_options(&db_path, options).expect("recover database");
 
             let rtx = db.read_tx();
 
             // Verify pre-checkpoint data
             for i in 0..100 {
                 let val = rtx.get(format!("pre_ckpt_key_{i}").as_bytes());
-                assert!(
-                    val.is_some(),
-                    "pre-checkpoint key {i} should be recovered"
-                );
+                assert!(val.is_some(), "pre-checkpoint key {i} should be recovered");
             }
 
             // Verify post-checkpoint data
             for i in 0..50 {
                 let val = rtx.get(format!("post_ckpt_key_{i}").as_bytes());
-                assert!(
-                    val.is_some(),
-                    "post-checkpoint key {i} should be recovered"
-                );
+                assert!(val.is_some(), "post-checkpoint key {i} should be recovered");
             }
         }
 
@@ -755,8 +747,8 @@ mod checkpoint_recovery {
 
         // Create checkpoint
         {
-            let mut db = Database::open_with_options(&db_path, options.clone())
-                .expect("open database");
+            let mut db =
+                Database::open_with_options(&db_path, options.clone()).expect("open database");
 
             {
                 let mut wtx = db.write_tx();
@@ -770,11 +762,13 @@ mod checkpoint_recovery {
 
         // Reopen and verify checkpoint info persisted
         {
-            let db = Database::open_with_options(&db_path, options)
-                .expect("reopen database");
+            let db = Database::open_with_options(&db_path, options).expect("reopen database");
 
             let recovered_lsn = db.checkpoint_lsn();
-            assert!(recovered_lsn.is_some(), "checkpoint LSN should be recovered");
+            assert!(
+                recovered_lsn.is_some(),
+                "checkpoint LSN should be recovered"
+            );
             assert_eq!(
                 recovered_lsn.unwrap(),
                 expected_lsn,

@@ -187,11 +187,14 @@ impl GroupCommitManager {
         for commit in pending_commits {
             let (lock, condvar) = &*commit.completed;
             let mut guard = lock.lock().unwrap();
-            *guard = Some(sync_result.as_ref().map(|_| ()).map_err(|e| {
-                Error::GroupCommitFailed {
-                    reason: format!("WAL sync failed: {e}"),
-                }
-            }));
+            *guard = Some(
+                sync_result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|e| Error::GroupCommitFailed {
+                        reason: format!("WAL sync failed: {e}"),
+                    }),
+            );
             condvar.notify_one();
         }
 
@@ -241,9 +244,7 @@ mod tests {
     fn test_wal_dir(name: &str) -> std::path::PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        std::path::PathBuf::from(format!(
-            "/tmp/thunder_gc_test_{name}_{pid}_{counter}"
-        ))
+        std::path::PathBuf::from(format!("/tmp/thunder_gc_test_{name}_{pid}_{counter}"))
     }
 
     fn cleanup(dir: &std::path::Path) {

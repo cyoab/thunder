@@ -227,12 +227,14 @@ impl IoBackend for SyncBackend {
                     source: e,
                 })?;
 
-            self.file.write_all(&op.data).map_err(|e| Error::FileWrite {
-                offset: op.offset,
-                len: op.data.len(),
-                context: "SyncBackend::write_batch write",
-                source: e,
-            })?;
+            self.file
+                .write_all(&op.data)
+                .map_err(|e| Error::FileWrite {
+                    offset: op.offset,
+                    len: op.data.len(),
+                    context: "SyncBackend::write_batch write",
+                    source: e,
+                })?;
         }
         Ok(())
     }

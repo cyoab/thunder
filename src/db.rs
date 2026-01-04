@@ -20,8 +20,8 @@ use crate::concurrent::PARALLEL_THRESHOLD;
 use crate::error::{Error, Result};
 use crate::meta::Meta;
 use crate::mmap::Mmap;
-use crate::overflow::{OverflowManager, OverflowRef, DEFAULT_OVERFLOW_THRESHOLD};
-use crate::page::{PageId, PageSizeConfig, PAGE_SIZE};
+use crate::overflow::{DEFAULT_OVERFLOW_THRESHOLD, OverflowManager, OverflowRef};
+use crate::page::{PAGE_SIZE, PageId, PageSizeConfig};
 use crate::tx::{ReadTx, WriteTx};
 use crate::wal::{Lsn, SyncPolicy, Wal, WalConfig};
 use crate::wal_record::WalRecord;
@@ -37,7 +37,13 @@ const DEFAULT_BLOOM_EXPECTED_KEYS: usize = 100_000;
 const DEFAULT_BLOOM_FP_RATE: f64 = 0.01;
 
 /// Result type for load_tree: (tree, data_end_offset, entry_count, bloom_filter, overflow_refs)
-type TreeLoadResult = (BTree, u64, u64, BloomFilter, std::collections::HashMap<Vec<u8>, OverflowRef>);
+type TreeLoadResult = (
+    BTree,
+    u64,
+    u64,
+    BloomFilter,
+    std::collections::HashMap<Vec<u8>, OverflowRef>,
+);
 
 /// Database configuration options.
 ///
@@ -76,8 +82,8 @@ impl Default for DatabaseOptions {
             wal_enabled: false,
             wal_dir: None,
             wal_sync_policy: SyncPolicy::default(),
-            wal_segment_size: 64 * 1024 * 1024, // 64MB
-            checkpoint_interval_secs: 300,       // 5 minutes
+            wal_segment_size: 64 * 1024 * 1024,          // 64MB
+            checkpoint_interval_secs: 300,               // 5 minutes
             checkpoint_wal_threshold: 128 * 1024 * 1024, // 128MB
         }
     }
@@ -90,7 +96,7 @@ impl DatabaseOptions {
     pub fn nvme_optimized() -> Self {
         Self {
             page_size: PageSizeConfig::Size32K,
-            overflow_threshold: 16 * 1024, // 16KB threshold
+            overflow_threshold: 16 * 1024,  // 16KB threshold
             write_buffer_size: 1024 * 1024, // 1MB buffer
             wal_enabled: false,
             wal_dir: None,
@@ -114,7 +120,7 @@ impl DatabaseOptions {
             page_size: PageSizeConfig::Size64K,
             // Use very high threshold - values up to 1MB inline
             // This avoids overflow page overhead for most use cases
-            overflow_threshold: 1024 * 1024, 
+            overflow_threshold: 1024 * 1024,
             write_buffer_size: 4 * 1024 * 1024, // 4MB buffer
             wal_enabled: false,
             wal_dir: None,
@@ -237,40 +243,67 @@ impl Database {
             }
         };
 
-        let (meta, mut tree, data_end_offset, persisted_entry_count, bloom, page_size, overflow_refs) =
-            if file_exists && file_len > 0 {
-                // Existing database: read and validate meta pages, load data.
-                let meta = Self::load_meta(&mut file, &path_buf)?;
+        let (
+            meta,
+            mut tree,
+            data_end_offset,
+            persisted_entry_count,
+            bloom,
+            page_size,
+            overflow_refs,
+        ) = if file_exists && file_len > 0 {
+            // Existing database: read and validate meta pages, load data.
+            let meta = Self::load_meta(&mut file, &path_buf)?;
 
-                // For existing databases, check if page size is valid
-                let stored_page_size = meta.page_size as usize;
-                if PageSizeConfig::from_u32(meta.page_size).is_none() {
-                    return Err(Error::Corrupted {
-                        context: "loading meta page",
-                        details: format!("invalid page size: {}", meta.page_size),
-                    });
-                }
+            // For existing databases, check if page size is valid
+            let stored_page_size = meta.page_size as usize;
+            if PageSizeConfig::from_u32(meta.page_size).is_none() {
+                return Err(Error::Corrupted {
+                    context: "loading meta page",
+                    details: format!("invalid page size: {}", meta.page_size),
+                });
+            }
 
-                // Check for page size mismatch
-                let expected_page_size = options.page_size.as_usize();
-                if stored_page_size != expected_page_size {
-                    return Err(Error::PageSizeMismatch {
-                        expected: expected_page_size as u32,
-                        actual: stored_page_size as u32,
-                    });
-                }
+            // Check for page size mismatch
+            let expected_page_size = options.page_size.as_usize();
+            if stored_page_size != expected_page_size {
+                return Err(Error::PageSizeMismatch {
+                    expected: expected_page_size as u32,
+                    actual: stored_page_size as u32,
+                });
+            }
 
-                let (tree, data_end, count, bloom, overflow_refs) =
-                    Self::load_tree(&mut file, &meta, stored_page_size, options.overflow_threshold)?;
-                (meta, tree, data_end, count, bloom, stored_page_size, overflow_refs)
-            } else {
-                // New database: initialize with two meta pages.
-                let page_size = options.page_size.as_usize();
-                let meta = Self::init_db(&mut file, &path_buf, page_size)?;
-                let data_offset = 2 * PAGE_SIZE as u64 + 8; // After meta pages + entry count
-                let bloom = BloomFilter::new(DEFAULT_BLOOM_EXPECTED_KEYS, DEFAULT_BLOOM_FP_RATE);
-                (meta, BTree::new(), data_offset, 0, bloom, page_size, std::collections::HashMap::new())
-            };
+            let (tree, data_end, count, bloom, overflow_refs) = Self::load_tree(
+                &mut file,
+                &meta,
+                stored_page_size,
+                options.overflow_threshold,
+            )?;
+            (
+                meta,
+                tree,
+                data_end,
+                count,
+                bloom,
+                stored_page_size,
+                overflow_refs,
+            )
+        } else {
+            // New database: initialize with two meta pages.
+            let page_size = options.page_size.as_usize();
+            let meta = Self::init_db(&mut file, &path_buf, page_size)?;
+            let data_offset = 2 * PAGE_SIZE as u64 + 8; // After meta pages + entry count
+            let bloom = BloomFilter::new(DEFAULT_BLOOM_EXPECTED_KEYS, DEFAULT_BLOOM_FP_RATE);
+            (
+                meta,
+                BTree::new(),
+                data_offset,
+                0,
+                bloom,
+                page_size,
+                std::collections::HashMap::new(),
+            )
+        };
 
         // Calculate next page ID for overflow manager
         let next_overflow_page = Self::calculate_next_overflow_page(data_end_offset, page_size);
@@ -509,10 +542,7 @@ impl Database {
         // Log successful initialization (only in debug builds).
         #[cfg(debug_assertions)]
         {
-            eprintln!(
-                "[thunder] initialized new database at '{}'",
-                path.display()
-            );
+            eprintln!("[thunder] initialized new database at '{}'", path.display());
         }
         let _ = path; // Suppress unused warning in release.
 
@@ -651,9 +681,7 @@ impl Database {
         if entry_count > MAX_ENTRIES {
             return Err(Error::Corrupted {
                 context: "loading data entries",
-                details: format!(
-                    "entry count {entry_count} exceeds maximum allowed {MAX_ENTRIES}"
-                ),
+                details: format!("entry count {entry_count} exceeds maximum allowed {MAX_ENTRIES}"),
             });
         }
 
@@ -728,12 +756,12 @@ impl Database {
                 })?;
 
                 // Read overflow value from file
-                let value = overflow_manager.read_overflow_from_file(oref, file).ok_or_else(|| {
-                    Error::Corrupted {
+                let value = overflow_manager
+                    .read_overflow_from_file(oref, file)
+                    .ok_or_else(|| Error::Corrupted {
                         context: "reading overflow value",
                         details: format!("entry {entry_idx}: failed to read overflow chain"),
-                    }
-                })?;
+                    })?;
 
                 // Store the overflow reference for later
                 overflow_refs.insert(key.clone(), oref);
@@ -853,7 +881,8 @@ impl Database {
 
             if value.len() > overflow_threshold {
                 // Allocate overflow pages as single contiguous buffer
-                let (oref, overflow_buffer) = self.overflow_manager.allocate_overflow_contiguous(value);
+                let (oref, overflow_buffer) =
+                    self.overflow_manager.allocate_overflow_contiguous(value);
 
                 // Track the first overflow page for the combined write
                 if first_overflow_page.is_none() && !overflow_buffer.is_empty() {
@@ -865,8 +894,10 @@ impl Database {
 
                 // Update the reference in entry_buf
                 buf_offset += 4; // Skip marker
-                entry_buf[buf_offset..buf_offset + 8].copy_from_slice(&oref.start_page.to_le_bytes());
-                entry_buf[buf_offset + 8..buf_offset + 12].copy_from_slice(&oref.total_len.to_le_bytes());
+                entry_buf[buf_offset..buf_offset + 8]
+                    .copy_from_slice(&oref.start_page.to_le_bytes());
+                entry_buf[buf_offset + 8..buf_offset + 12]
+                    .copy_from_slice(&oref.total_len.to_le_bytes());
                 buf_offset += 12;
 
                 new_overflow_refs.insert(key.to_vec(), oref);
@@ -926,7 +957,11 @@ impl Database {
         self.meta.root = if self.tree.is_empty() { 0 } else { 1 };
 
         // Write to alternating meta page.
-        let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
+        let meta_page = if self.meta.txid.is_multiple_of(2) {
+            0
+        } else {
+            1
+        };
         let meta_offset = meta_page * PAGE_SIZE as u64;
 
         if let Err(e) = self.file.seek(SeekFrom::Start(meta_offset)) {
@@ -1237,7 +1272,11 @@ impl Database {
         self.meta.txid += 1;
         self.meta.root = 1; // We have data
 
-        let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
+        let meta_page = if self.meta.txid.is_multiple_of(2) {
+            0
+        } else {
+            1
+        };
         let meta_offset = meta_page * PAGE_SIZE as u64;
 
         // Use pwrite for positioned writes without seeking (Unix only)
@@ -1245,7 +1284,7 @@ impl Database {
         #[cfg(unix)]
         {
             let meta_bytes = self.meta.to_bytes();
-            
+
             // Write meta page using pwrite
             if let Err(e) = self.file.write_at(&meta_bytes, meta_offset) {
                 return Err(Error::FileWrite {
@@ -1258,7 +1297,10 @@ impl Database {
 
             // Write entry count using pwrite
             let data_offset = 2 * PAGE_SIZE as u64;
-            if let Err(e) = self.file.write_at(&total_entry_count.to_le_bytes(), data_offset) {
+            if let Err(e) = self
+                .file
+                .write_at(&total_entry_count.to_le_bytes(), data_offset)
+            {
                 return Err(Error::FileWrite {
                     offset: data_offset,
                     len: 8,
@@ -1295,7 +1337,7 @@ impl Database {
         #[cfg(not(unix))]
         {
             let meta_bytes = self.meta.to_bytes();
-            
+
             if let Err(e) = self.file.seek(SeekFrom::Start(meta_offset)) {
                 return Err(Error::FileSeek {
                     offset: meta_offset,
@@ -1445,9 +1487,7 @@ impl Database {
         let total_overflow_size: usize = prepared
             .iter()
             .filter(|e| e.is_overflow)
-            .map(|e| {
-                OverflowManager::direct_buffer_size(e.overflow_value.as_ref().unwrap().len())
-            })
+            .map(|e| OverflowManager::direct_buffer_size(e.overflow_value.as_ref().unwrap().len()))
             .sum();
 
         // Pre-allocate buffers
@@ -1513,7 +1553,11 @@ impl Database {
         self.meta.txid += 1;
         self.meta.root = 1;
 
-        let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
+        let meta_page = if self.meta.txid.is_multiple_of(2) {
+            0
+        } else {
+            1
+        };
         let meta_offset = meta_page * PAGE_SIZE as u64;
 
         #[cfg(unix)]
@@ -1530,7 +1574,10 @@ impl Database {
             }
 
             let data_offset = 2 * PAGE_SIZE as u64;
-            if let Err(e) = self.file.write_at(&total_entry_count.to_le_bytes(), data_offset) {
+            if let Err(e) = self
+                .file
+                .write_at(&total_entry_count.to_le_bytes(), data_offset)
+            {
                 return Err(Error::FileWrite {
                     offset: data_offset,
                     len: 8,
@@ -1646,7 +1693,11 @@ impl Database {
     fn sync_meta_only(&mut self) -> Result<()> {
         self.meta.txid += 1;
 
-        let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
+        let meta_page = if self.meta.txid.is_multiple_of(2) {
+            0
+        } else {
+            1
+        };
         let meta_offset = meta_page * PAGE_SIZE as u64;
 
         if let Err(e) = self.file.seek(SeekFrom::Start(meta_offset)) {
@@ -1822,22 +1873,30 @@ impl Database {
         self.meta.set_checkpoint_info(&ckpt_info);
 
         // Write meta page
-        let meta_page = if self.meta.txid.is_multiple_of(2) { 0 } else { 1 };
+        let meta_page = if self.meta.txid.is_multiple_of(2) {
+            0
+        } else {
+            1
+        };
         let meta_offset = meta_page * PAGE_SIZE as u64;
 
-        self.file.seek(SeekFrom::Start(meta_offset)).map_err(|e| Error::FileSeek {
-            offset: meta_offset,
-            context: "seeking to meta page for checkpoint",
-            source: e,
-        })?;
+        self.file
+            .seek(SeekFrom::Start(meta_offset))
+            .map_err(|e| Error::FileSeek {
+                offset: meta_offset,
+                context: "seeking to meta page for checkpoint",
+                source: e,
+            })?;
 
         let meta_bytes = self.meta.to_bytes();
-        self.file.write_all(&meta_bytes).map_err(|e| Error::FileWrite {
-            offset: meta_offset,
-            len: PAGE_SIZE,
-            context: "writing meta page for checkpoint",
-            source: e,
-        })?;
+        self.file
+            .write_all(&meta_bytes)
+            .map_err(|e| Error::FileWrite {
+                offset: meta_offset,
+                len: PAGE_SIZE,
+                context: "writing meta page for checkpoint",
+                source: e,
+            })?;
 
         Self::fdatasync(&self.file)?;
 
@@ -1877,9 +1936,7 @@ impl Database {
     #[allow(dead_code)]
     pub(crate) fn wal_delete(&mut self, key: &[u8]) -> Result<Option<Lsn>> {
         if let Some(wal) = &mut self.wal {
-            let lsn = wal.append(&WalRecord::Delete {
-                key: key.to_vec(),
-            })?;
+            let lsn = wal.append(&WalRecord::Delete { key: key.to_vec() })?;
             Ok(Some(lsn))
         } else {
             Ok(None)
@@ -1932,4 +1989,3 @@ impl Database {
         self.meta.txid + 1
     }
 }
-

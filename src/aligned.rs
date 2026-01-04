@@ -4,7 +4,7 @@
 //! This module provides aligned buffer allocation required for O_DIRECT I/O,
 //! where memory addresses must be aligned to filesystem block boundaries.
 
-use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 
@@ -230,8 +230,8 @@ impl DerefMut for AlignedBuffer {
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         // SAFETY: Layout matches the one used for allocation.
-        let layout = Layout::from_size_align(self.capacity, self.alignment)
-            .expect("layout should be valid");
+        let layout =
+            Layout::from_size_align(self.capacity, self.alignment).expect("layout should be valid");
         unsafe {
             dealloc(self.ptr.as_ptr(), layout);
         }

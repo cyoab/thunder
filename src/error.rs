@@ -16,15 +16,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 pub enum Error {
     /// Failed to open or create the database file.
-    FileOpen {
-        path: PathBuf,
-        source: io::Error,
-    },
+    FileOpen { path: PathBuf, source: io::Error },
     /// Failed to read file metadata.
-    FileMetadata {
-        path: PathBuf,
-        source: io::Error,
-    },
+    FileMetadata { path: PathBuf, source: io::Error },
     /// Failed to seek within the database file.
     FileSeek {
         offset: u64,
@@ -63,10 +57,7 @@ pub enum Error {
     /// Both meta pages are invalid.
     BothMetaPagesInvalid,
     /// Invalid page encountered during read.
-    InvalidPage {
-        page_id: u64,
-        reason: String,
-    },
+    InvalidPage { page_id: u64, reason: String },
     /// Failed to read entry during data load.
     EntryReadFailed {
         entry_index: u64,
@@ -83,29 +74,19 @@ pub enum Error {
     /// Key not found in the database.
     KeyNotFound,
     /// Bucket not found.
-    BucketNotFound {
-        name: Vec<u8>,
-    },
+    BucketNotFound { name: Vec<u8> },
     /// Bucket already exists.
-    BucketAlreadyExists {
-        name: Vec<u8>,
-    },
+    BucketAlreadyExists { name: Vec<u8> },
     /// Invalid bucket name (empty or too long).
-    InvalidBucketName {
-        reason: &'static str,
-    },
+    InvalidBucketName { reason: &'static str },
     /// Database is already open.
     DatabaseAlreadyOpen,
     /// Page size mismatch when opening existing database.
-    PageSizeMismatch {
-        expected: u32,
-        actual: u32,
-    },
+    PageSizeMismatch { expected: u32, actual: u32 },
     /// Generic I/O error (legacy, prefer specific variants).
     Io(io::Error),
 
     // ==================== Phase 3: I/O Stack Errors ====================
-
     /// io_uring initialization failed.
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
     IoUringInit {
@@ -122,10 +103,7 @@ pub enum Error {
 
     /// io_uring completion reported error.
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
-    IoUringCompletion {
-        context: &'static str,
-        errno: i32,
-    },
+    IoUringCompletion { context: &'static str, errno: i32 },
 
     /// io_uring submission queue full.
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
@@ -139,7 +117,6 @@ pub enum Error {
     },
 
     // ==================== Phase 4: WAL & Checkpoint Errors ====================
-
     /// WAL segment corrupted.
     WalCorrupted {
         segment_id: u64,
@@ -148,42 +125,58 @@ pub enum Error {
     },
 
     /// WAL record invalid or corrupted.
-    WalRecordInvalid {
-        lsn: u64,
-        reason: String,
-    },
+    WalRecordInvalid { lsn: u64, reason: String },
 
     /// Checkpoint operation failed.
-    CheckpointFailed {
-        lsn: u64,
-        reason: String,
-    },
+    CheckpointFailed { lsn: u64, reason: String },
 
     /// Group commit operation failed.
-    GroupCommitFailed {
-        reason: String,
-    },
+    GroupCommitFailed { reason: String },
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::FileOpen { path, source } => {
-                write!(f, "failed to open database file '{}': {}", path.display(), source)
+                write!(
+                    f,
+                    "failed to open database file '{}': {}",
+                    path.display(),
+                    source
+                )
             }
             Error::FileMetadata { path, source } => {
-                write!(f, "failed to read metadata for '{}': {}", path.display(), source)
+                write!(
+                    f,
+                    "failed to read metadata for '{}': {}",
+                    path.display(),
+                    source
+                )
             }
-            Error::FileSeek { offset, context, source } => {
+            Error::FileSeek {
+                offset,
+                context,
+                source,
+            } => {
                 write!(f, "failed to seek to offset {offset} ({context}): {source}")
             }
-            Error::FileRead { offset, len, context, source } => {
+            Error::FileRead {
+                offset,
+                len,
+                context,
+                source,
+            } => {
                 write!(
                     f,
                     "failed to read {len} bytes at offset {offset} ({context}): {source}"
                 )
             }
-            Error::FileWrite { offset, len, context, source } => {
+            Error::FileWrite {
+                offset,
+                len,
+                context,
+                source,
+            } => {
                 write!(
                     f,
                     "failed to write {len} bytes at offset {offset} ({context}): {source}"
@@ -195,7 +188,10 @@ impl fmt::Display for Error {
             Error::Corrupted { context, details } => {
                 write!(f, "database corrupted ({context}): {details}")
             }
-            Error::InvalidMetaPage { page_number, reason } => {
+            Error::InvalidMetaPage {
+                page_number,
+                reason,
+            } => {
                 write!(f, "meta page {page_number} is invalid: {reason}")
             }
             Error::BothMetaPagesInvalid => {
@@ -204,7 +200,11 @@ impl fmt::Display for Error {
             Error::InvalidPage { page_id, reason } => {
                 write!(f, "invalid page {page_id}: {reason}")
             }
-            Error::EntryReadFailed { entry_index, field, source } => {
+            Error::EntryReadFailed {
+                entry_index,
+                field,
+                source,
+            } => {
                 write!(
                     f,
                     "failed to read {field} for entry {entry_index}: {source}"
@@ -223,7 +223,11 @@ impl fmt::Display for Error {
                 write!(f, "bucket not found: {:?}", String::from_utf8_lossy(name))
             }
             Error::BucketAlreadyExists { name } => {
-                write!(f, "bucket already exists: {:?}", String::from_utf8_lossy(name))
+                write!(
+                    f,
+                    "bucket already exists: {:?}",
+                    String::from_utf8_lossy(name)
+                )
             }
             Error::InvalidBucketName { reason } => {
                 write!(f, "invalid bucket name: {reason}")
@@ -254,7 +258,11 @@ impl fmt::Display for Error {
             Error::IoUringQueueFull => {
                 write!(f, "io_uring submission queue full")
             }
-            Error::DirectIoAlignment { offset, len, required_alignment } => {
+            Error::DirectIoAlignment {
+                offset,
+                len,
+                required_alignment,
+            } => {
                 write!(
                     f,
                     "direct I/O alignment error: offset {offset}, len {len} must be aligned to {required_alignment}"
@@ -262,8 +270,15 @@ impl fmt::Display for Error {
             }
 
             // Phase 4: WAL & Checkpoint Errors
-            Error::WalCorrupted { segment_id, offset, reason } => {
-                write!(f, "WAL corrupted at segment {segment_id}, offset {offset}: {reason}")
+            Error::WalCorrupted {
+                segment_id,
+                offset,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "WAL corrupted at segment {segment_id}, offset {offset}: {reason}"
+                )
             }
             Error::WalRecordInvalid { lsn, reason } => {
                 write!(f, "WAL record invalid at LSN {lsn}: {reason}")
@@ -288,9 +303,9 @@ impl std::error::Error for Error {
             Error::FileWrite { source, .. } => Some(source),
             Error::FileSync { source, .. } => Some(source),
             Error::EntryReadFailed { source, .. } => Some(source),
-            Error::TxCommitFailed { source, .. } => {
-                source.as_ref().map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
-            }
+            Error::TxCommitFailed { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &(dyn std::error::Error + 'static)),
             Error::Io(err) => Some(err),
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
             Error::IoUringInit { source, .. } => Some(source),
