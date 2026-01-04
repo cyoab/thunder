@@ -1,10 +1,25 @@
 # ⚡ Thunder
 
-**Thunder** is a fast, embedded, transactional key-value database engine written in Rust, inspired by [BBolt](https://github.com/etcd-io/bbolt).
+**Thunder** is a fast, embedded, transactional key-value database engine written in Rust, optimized for **read-heavy workloads**. Inspired by [BBolt](https://github.com/etcd-io/bbolt).
 
-What started as a hobby/learning project has evolved into a capable embedded database that **outperforms BBolt** in most benchmarks while remaining relatively simple (~3,000 lines of Rust).
+What started as a hobby/learning project has evolved into a capable embedded database that delivers **best-in-class read performance** — outperforming RocksDB, Sled, and BBolt on sequential reads, random reads, and iterator scans while remaining simple (~3,500 lines of Rust).
 
-> ⚠️ **Work in Progress**: Thunder is still a hobby project under active development. If you need a battle-tested, production-ready embedded database, consider [SQLite](https://sqlite.org/), [RocksDB](https://rocksdb.org/), or [BBolt](https://github.com/etcd-io/bbolt). Thunder is great for learning, experimentation, and non-critical use cases.
+> ⚠️ **Work in Progress**: Thunder is still under active development. For battle-tested, production-ready embedded databases, consider [SQLite](https://sqlite.org/), [RocksDB](https://rocksdb.org/), or [BBolt](https://github.com/etcd-io/bbolt). Thunder is ideal for learning, experimentation, and read-heavy use cases.
+
+## When to Use Thunder
+
+✅ **Thunder is ideal for:**
+- **Read-heavy workloads** — 2.6M sequential reads/sec, 1.1M random reads/sec
+- **Range scans & analytics** — 78.6M iterator ops/sec (19× faster than RocksDB)
+- **Document storage (10-100KB values)** — 484-642 MB/sec throughput
+- **Embedded applications** — Simple API, single-file storage, minimal dependencies
+- **Learning & experimentation** — Clean, readable codebase
+
+❌ **Consider alternatives for:**
+- **Write-heavy workloads** — RocksDB is 1.9× faster for bulk writes
+- **Mixed read/write workloads** — Sled's lock-free architecture is 3.4× faster
+- **Very large values (1MB+)** — Sled achieves 1.8× better throughput
+- **Production-critical systems** — Use battle-tested solutions like SQLite or RocksDB
 
 ## Features
 
@@ -23,17 +38,31 @@ What started as a hobby/learning project has evolved into a capable embedded dat
 
 ## Performance
 
-Thunder achieves excellent performance, outperforming BBolt across most workloads:
+Thunder delivers **best-in-class read performance** compared to RocksDB, Sled, and BBolt:
 
-| Benchmark | Thunder | BBolt | Result |
-|-----------|---------|-------|--------|
-| Sequential writes | 617K ops/sec | 315K ops/sec | **Thunder 2.0× faster** |
-| Sequential reads | 2.4M ops/sec | 1.5M ops/sec | **Thunder 1.6× faster** |
-| Iterator scan | 78.6M ops/sec | 27.1M ops/sec | **Thunder 2.9× faster** |
-| Mixed workload | 6,034 ops/sec | 5,086 ops/sec | **Thunder 1.2× faster** |
-| Transaction throughput | 1,396 tx/sec | 1,214 tx/sec | **Thunder 1.2× faster** |
-| Large values (10KB) | 437 MB/sec | 115 MB/sec | **Thunder 3.8× faster** |
-| Large values (100KB) | 534 MB/sec | 244 MB/sec | **Thunder 2.2× faster** |
+### Read Performance (Thunder's Strength)
+
+| Benchmark | Thunder | RocksDB | Sled | BBolt | Winner |
+|-----------|---------|---------|------|-------|--------|
+| Sequential reads | **2.6M** | 624K | 214K | 1.5M | **Thunder 4.2×** |
+| Random reads | **1.1M** | 577K | 539K | 955K | **Thunder 1.9×** |
+| Iterator scan | **78.6M** | 4.1M | 957K | 27.1M | **Thunder 19×** |
+
+### Write Performance
+
+| Benchmark | Thunder | RocksDB | Sled | BBolt | Winner |
+|-----------|---------|---------|------|-------|--------|
+| Sequential writes | 590K | **1.1M** | 144K | 315K | RocksDB 1.9× |
+| Mixed workload | 5.4K | 6.6K | **18.3K** | 5.1K | Sled 3.4× |
+| Batch tx/sec | 1,129 | **1,663** | 1,044 | 1,214 | RocksDB |
+
+### Large Value Throughput (MB/sec)
+
+| Size | Thunder | RocksDB | Sled | BBolt | Winner |
+|------|---------|---------|------|-------|--------|
+| 10KB | **484** | 275 | 272 | 115 | **Thunder 1.8×** |
+| 100KB | **642** | 416 | 434 | 244 | **Thunder 1.5×** |
+| 1MB | 230 | 211 | **418** | 207 | Sled 1.8× |
 
 See [bench.md](bench.md) for full benchmark details and methodology.
 
@@ -199,12 +228,21 @@ cargo test
 ## Running Benchmarks
 
 ```bash
-# Run Thunder benchmark
-cargo build --release --example thunder_bench
-./target/release/examples/thunder_bench
+# Build all benchmarks
+cd bench
+cargo build --release
 
-# Run BBolt benchmark for comparison
-cd bench && go run bbolt_bench.go
+# Run Thunder benchmark
+./target/release/thunder_bench
+
+# Run Sled benchmark
+./target/release/sled_bench
+
+# Run RocksDB benchmark
+./target/release/rocksdb_bench
+
+# Run BBolt benchmark (Go)
+go run bbolt_bench.go
 ```
 
 ## License

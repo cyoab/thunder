@@ -1,4 +1,2 @@
 /target
-/bench/bbolt_bench
-bench_plan.md
-optimizations.md
+/bench/target

@@ -1,0 +1,21 @@
+[package]
+name = "thunder-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "thunder_bench"
+path = "thunder_bench.rs"
+
+[[bin]]
+name = "sled_bench"
+path = "sled_bench.rs"
+
+[[bin]]
+name = "rocksdb_bench"
+path = "rocksdb_bench.rs"
+
+[dependencies]
+thunder = { path = ".." }
+sled = "0.34"
+rocksdb = "0.22"

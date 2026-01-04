@@ -17,3 +17,7 @@ rayon = "1.11"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
+
+[[example]]
+name = "thunder_bench"
+path = "examples/thunder_bench.rs"
