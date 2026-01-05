@@ -1,70 +1,36 @@
-# ⚡ ThunderDB
+# ThunderDB
 
-**ThunderDB** is a high-performance, embedded, transactional key-value database engine written in Rust. Keys and values are arbitrarily-sized byte streams. Optimized for fast, low-latency storage such as flash drives and high-speed disk drives, ThunderDB exploits the full potential of high read/write rates offered by flash or RAM.
+ThunderDB is an embedded, transactional key-value database written in Rust. It provides ACID transactions with crash-safe commits, MVCC concurrency, and a simple API for storing arbitrary byte sequences.
 
-Inspired by [BBolt](https://github.com/etcd-io/bbolt) and [RocksDB](https://rocksdb.org/), ThunderDB delivers **best-in-class read performance** — outperforming RocksDB, Sled, and BBolt on sequential reads, random reads, and iterator scans.
+## Status
 
-> ⚠️ **Work in Progress**: ThunderDB is still under active development and showing promising benchmark results. However, more comprehensive benchmarking is required and the project continues to evolve. For battle-tested, production-ready embedded databases, consider [SQLite](https://sqlite.org/), [RocksDB](https://rocksdb.org/), or [BBolt](https://github.com/etcd-io/bbolt).
+ThunderDB is under active development. While the core functionality is implemented and tested, it has not yet been deployed in production environments. For mission-critical applications, consider established alternatives such as [SQLite](https://sqlite.org/), [RocksDB](https://rocksdb.org/), or [BBolt](https://github.com/etcd-io/bbolt).
 
-## When to Use Thunder
+## Design Goals
 
-✅ **ThunderDB is ideal for:**
-- **Read-heavy workloads** — 2.6M sequential reads/sec, 1.1M random reads/sec
-- **Range scans & analytics** — 78.6M iterator ops/sec (19× faster than RocksDB)
-- **Document storage (10-100KB values)** — 484-642 MB/sec throughput
-- **Embedded applications** — Single-file storage, minimal dependencies
-- **Low-latency storage** — Optimized for flash drives and high-speed disks
-
-❌ **Consider alternatives for:**
-- **Write-heavy workloads** — RocksDB is 1.9× faster for bulk writes
-- **Mixed read/write workloads** — Sled's lock-free architecture is 3.4× faster
-- **Very large values (1MB+)** — Sled achieves 1.8× better throughput
-- **Production-critical systems** — Use battle-tested solutions like SQLite or RocksDB
+- **Correctness first** — ACID guarantees with verified crash recovery
+- **Predictable performance** — Consistent latency over time
+- **Minimal complexity** — Small codebase, few dependencies
+- **Well-documented internals** — File format and durability semantics are specified
 
 ## Features
 
-- **Embedded** — Runs in-process as a Rust library, no server required
+- **ACID transactions** — Atomic commits with crash recovery via dual meta pages
+- **MVCC concurrency** — Multiple readers, single writer without blocking
 - **Single-file storage** — Entire database in one file
-- **ACID transactions** — Full durability with crash-safe commits
-- **MVCC** — Multiple concurrent readers, single writer
-- **Buckets** — Logical namespaces for organizing data
-- **Nested buckets** — Hierarchical bucket organization (up to 16 levels deep)
-- **Range queries** — Efficient iteration and range scans
-- **Zero-copy reads** — `get_ref()` API returns references without allocation
-- **Bloom filter** — Fast rejection of non-existent keys (8.5M ops/sec)
-- **CRC32 checksums** — Data integrity verification with SIMD acceleration
-- **Parallel writes** — Bulk operations use rayon for multi-core throughput (1M+ ops/sec)
-- **Minimal dependencies** — Only `libc`, `crc32fast`, `nix`, and `rayon`
+- **Configurable durability** — Immediate fsync, batched, or application-controlled
+- **Buckets** — Logical namespaces for data organization
+- **Nested buckets** — Hierarchical structure up to 16 levels
+- **Range queries** — Forward iteration with range bounds
+- **Write-ahead log** — Optional WAL for group commits and faster durability
+- **Checksums** — FNV-1a for metadata, CRC32 for data integrity
 
-## Performance
+## Documentation
 
-Thunder delivers **best-in-class read performance** compared to RocksDB, Sled, and BBolt:
-
-### Read Performance (Thunder's Strength)
-
-| Benchmark | Thunder | RocksDB | Sled | BBolt | Winner |
-|-----------|---------|---------|------|-------|--------|
-| Sequential reads | **2.6M** | 624K | 214K | 1.5M | **Thunder 4.2×** |
-| Random reads | **1.1M** | 577K | 539K | 955K | **Thunder 1.9×** |
-| Iterator scan | **78.6M** | 4.1M | 957K | 27.1M | **Thunder 19×** |
-
-### Write Performance
-
-| Benchmark | Thunder | RocksDB | Sled | BBolt | Winner |
-|-----------|---------|---------|------|-------|--------|
-| Sequential writes | 590K | **1.1M** | 144K | 315K | RocksDB 1.9× |
-| Mixed workload | 5.4K | 6.6K | **18.3K** | 5.1K | Sled 3.4× |
-| Batch tx/sec | 1,129 | **1,663** | 1,044 | 1,214 | RocksDB |
-
-### Large Value Throughput (MB/sec)
-
-| Size | Thunder | RocksDB | Sled | BBolt | Winner |
-|------|---------|---------|------|-------|--------|
-| 10KB | **484** | 275 | 272 | 115 | **Thunder 1.8×** |
-| 100KB | **642** | 416 | 434 | 244 | **Thunder 1.5×** |
-| 1MB | 230 | 211 | **418** | 207 | Sled 1.8× |
-
-See [bench.md](bench.md) for full benchmark details and methodology.
+| Document | Description |
+|----------|-------------|
+| [docs/durability.md](docs/durability.md) | Durability guarantees, syscalls, crash recovery |
+| [docs/file-format.md](docs/file-format.md) | Binary format specification, versioning |
 
 ## Quick Start
 
@@ -72,154 +38,148 @@ See [bench.md](bench.md) for full benchmark details and methodology.
 use thunderdb::Database;
 
 fn main() -> thunderdb::Result<()> {
-    // Open or create a database
     let mut db = Database::open("my.db")?;
 
-    // Write data
+    // Write transaction
     {
         let mut tx = db.write_tx();
-        tx.put(b"hello", b"world");
-        tx.put(b"foo", b"bar");
-        tx.commit()?;
+        tx.put(b"key", b"value");
+        tx.commit()?;  // Data is durable when this returns Ok
     }
 
-    // Read data
+    // Read transaction
     {
         let tx = db.read_tx();
-        assert_eq!(tx.get(b"hello"), Some(b"world".to_vec()));
+        assert_eq!(tx.get(b"key"), Some(b"value".to_vec()));
     }
 
     Ok(())
 }
 ```
 
-## Buckets
+## Durability
 
-Organize data into logical namespaces:
+When `commit()` returns `Ok(())`:
+
+1. All data has been written to the file
+2. `fdatasync()` has been called to flush to stable storage
+3. The transaction is recoverable after power loss
+
+ThunderDB uses dual meta pages for atomic commits. On recovery, the meta page with the higher transaction ID and valid checksum is selected. See [docs/durability.md](docs/durability.md) for details.
+
+### Sync Policies
 
 ```rust
-let mut tx = db.write_tx();
+use thunderdb::{Database, DatabaseOptions, SyncPolicy};
+use std::time::Duration;
 
-// Create buckets
-tx.create_bucket(b"users")?;
-tx.create_bucket(b"posts")?;
+// Maximum durability (default)
+let db = Database::open("safe.db")?;
 
-// Write to buckets
-tx.bucket_put(b"users", b"alice", b"data")?;
-tx.bucket_put(b"posts", b"post1", b"content")?;
-
-tx.commit()?;
+// With WAL and batched sync (higher throughput)
+let opts = DatabaseOptions {
+    wal_enabled: true,
+    wal_sync_policy: SyncPolicy::Batched(Duration::from_millis(10)),
+    ..Default::default()
+};
+let db = Database::open_with_options("batched.db", opts)?;
 ```
 
-## Nested Buckets
+## File Format
 
-Create hierarchical bucket structures for complex data organization:
+ThunderDB uses a page-based format with these characteristics:
+
+| Property | Value |
+|----------|-------|
+| Magic number | `0x54484E44` ("THND") |
+| Format version | 3 |
+| Default page size | 32 KB |
+| Supported page sizes | 4K, 8K, 16K, 32K, 64K |
+| Byte order | Little-endian |
+
+The format is documented in [docs/file-format.md](docs/file-format.md).
+
+## Buckets
 
 ```rust
 let mut tx = db.write_tx();
 
-// Create parent bucket
-tx.create_bucket(b"config")?;
-
-// Create nested buckets
-tx.create_nested_bucket(b"config", b"network")?;
-tx.create_nested_bucket(b"config", b"storage")?;
-
-// Write to nested buckets
-tx.nested_bucket_put(b"config", b"network", b"host", b"localhost")?;
-tx.nested_bucket_put(b"config", b"network", b"port", b"8080")?;
-
-// Create deeply nested buckets (up to 16 levels)
-tx.create_nested_bucket_at_path(&[b"config", b"storage"], b"cache")?;
-tx.nested_bucket_put_at_path(&[b"config", b"storage", b"cache"], b"size", b"1GB")?;
-
+tx.create_bucket(b"users")?;
+tx.bucket_put(b"users", b"alice", b"data")?;
 tx.commit()?;
 
-// Read from nested buckets
-let rtx = db.read_tx();
-let network = rtx.nested_bucket(b"config", b"network")?;
-assert_eq!(network.get(b"host"), Some(&b"localhost"[..]));
+let tx = db.read_tx();
+let value = tx.bucket_get(b"users", b"alice");
+```
 
-// List nested buckets
-let children = rtx.list_nested_buckets(b"config")?;
-assert!(children.contains(&b"network".to_vec()));
+### Nested Buckets
+
+```rust
+let mut tx = db.write_tx();
+
+tx.create_bucket(b"config")?;
+tx.create_nested_bucket(b"config", b"network")?;
+tx.nested_bucket_put(b"config", b"network", b"host", b"localhost")?;
+tx.commit()?;
 ```
 
 ## Bulk Operations
 
-For high-throughput writes, use the batch APIs which leverage parallel processing:
-
 ```rust
 let mut tx = db.write_tx();
 
-// Bulk insert (parallelized for batches >= 100 entries)
 let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..10_000)
-    .map(|i| (format!("key_{i}").into_bytes(), format!("value_{i}").into_bytes()))
+    .map(|i| (format!("key_{i}").into_bytes(), format!("val_{i}").into_bytes()))
     .collect();
 
 tx.batch_put(entries);
 tx.commit()?;
 ```
 
-**Bulk write throughput:**
-| Batch Size | Throughput |
-|------------|------------|
-| 1,000 entries | ~720K ops/sec |
-| 10,000 entries | ~910K ops/sec |
-| 100,000 entries | ~1.08M ops/sec |
+Bulk operations use parallel serialization for batches ≥100 entries.
+
+## Performance
+
+Preliminary benchmarks show competitive read performance. Write performance varies by workload.
+
+| Operation | Throughput | Notes |
+|-----------|------------|-------|
+| Sequential reads | ~2.6M ops/sec | In-memory B+ tree |
+| Random reads | ~1.1M ops/sec | — |
+| Iterator scan | ~78M ops/sec | Zero-copy iteration |
+| Sequential writes | ~590K ops/sec | Append-only path |
+| Bulk writes | ~1M ops/sec | With parallel serialization |
+
+These numbers are from a single machine and may not reflect your workload. See [bench.md](bench.md) for methodology.
 
 ## Limitations
 
-ThunderDB has some limitations compared to mature solutions:
+- **No compaction** — Deleted data is not reclaimed automatically
+- **No encryption** — Data stored in plaintext
+- **No compression** — Values stored as-is
+- **Forward-only iteration** — No reverse or bidirectional cursors
+- **Single writer** — Write transactions are serialized
 
-- **No cursor API** — Only forward iteration is currently supported
-- **No compaction** — Deleted data is not reclaimed until full rewrite
-- **No encryption** — Data is stored in plaintext
-- **No compression** — Values are stored as-is
-- **Limited testing** — Not yet battle-tested in production environments
+Encryption and compression are left to the application layer by design.
 
-### Design Philosophy
+## Testing
 
-Encryption and compression are intentional design choices. ThunderDB serves as a **storage primitive** — it is the responsibility of the application or a higher-level system to handle encryption, compression, and other data transformations. This keeps the core database lean and focused on performance.
+```bash
+# Unit and integration tests
+cargo test
 
-### Roadmap
+# With failpoint testing (crash simulation)
+cargo test --features failpoint
 
-Planned features for future releases:
-- **Cursor API** — Bidirectional iteration with seek support
-- **Compaction** — Reclaim space from deleted entries
-
-For production use cases requiring stability and robustness, please use established solutions like SQLite, RocksDB, or BBolt.
-
-## Architecture
-
-```
-src/
-├── lib.rs        # Public API
-├── db.rs         # Database open/close, persistence
-├── tx.rs         # Read and write transactions
-├── btree.rs      # In-memory B+ tree
-├── bucket.rs     # Bucket management
-├── bloom.rs      # Bloom filter for fast negative lookups
-├── overflow.rs   # Large value handling
-├── page.rs       # Page layout constants
-├── meta.rs       # Meta page handling
-├── mmap.rs       # Memory-mapped I/O
-├── ivec.rs       # Inline vector optimization
-├── concurrent.rs # Parallel write support (rayon)
-└── error.rs      # Error types
+# Clippy and formatting
+cargo clippy --all-features
+cargo fmt --check
 ```
 
-### Key Optimizations
-
-1. **In-memory B+ tree** — The entire tree lives in memory for fast reads
-2. **Append-only writes** — New entries are appended, enabling fast commits
-3. **fdatasync** — Uses `fdatasync()` instead of `fsync()` to reduce latency
-4. **Zero-copy reads** — `get_ref()` returns references without allocation
-5. **Bloom filter** — Fast rejection of non-existent keys
-6. **Direct overflow format** — Large values use compact storage (12 bytes overhead)
-7. **SIMD checksums** — CRC32 with hardware acceleration (~10 GB/s)
-8. **pwrite** — Positioned writes avoid seek syscalls
-9. **Parallel serialization** — Bulk writes use rayon for multi-core data preparation
+The test suite includes crash safety tests with failpoint injection at:
+- Before/after data writes
+- Before/after meta page writes  
+- Before/after fsync
 
 ## Building
 
@@ -227,31 +187,37 @@ src/
 cargo build --release
 ```
 
-## Testing
+### Feature Flags
 
-```bash
-cargo test
+| Flag | Description |
+|------|-------------|
+| `failpoint` | Enable crash testing infrastructure |
+| `io_uring` | Linux io_uring backend (experimental) |
+| `no_checksum` | Disable data checksums for max throughput |
+
+## Architecture
+
+```
+src/
+├── db.rs         # Database core, persistence
+├── tx.rs         # Transaction implementation
+├── btree.rs      # In-memory B+ tree
+├── bucket.rs     # Bucket management
+├── meta.rs       # Meta page handling
+├── wal.rs        # Write-ahead log
+├── checkpoint.rs # WAL checkpointing
+├── overflow.rs   # Large value storage
+├── mmap.rs       # Memory-mapped I/O
+├── failpoint.rs  # Crash testing (feature-gated)
+└── error.rs      # Error types
 ```
 
-## Running Benchmarks
+## Dependencies
 
-```bash
-# Build all benchmarks
-cd bench
-cargo build --release
-
-# Run Thunder benchmark
-./target/release/thunder_bench
-
-# Run Sled benchmark
-./target/release/sled_bench
-
-# Run RocksDB benchmark
-./target/release/rocksdb_bench
-
-# Run BBolt benchmark (Go)
-go run bbolt_bench.go
-```
+- `libc` — System calls
+- `crc32fast` — SIMD-accelerated checksums
+- `nix` — Unix file operations
+- `rayon` — Parallel bulk operations
 
 ## License
 
